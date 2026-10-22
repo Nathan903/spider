@@ -15,6 +15,7 @@ secrecy = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+spider-dag = { workspace = true }
 spider-derive = { workspace = true }
 spider-utils = { workspace = true }
 sqlx = { workspace = true }
