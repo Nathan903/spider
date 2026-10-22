@@ -1974,6 +1974,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "spider-dag",
  "spider-derive",
  "spider-utils",
  "sqlx",
@@ -1982,6 +1983,13 @@ dependencies = [
  "tokio",
  "tokio-util",
  "zstd",
+]
+
+[[package]]
+name = "spider-dag"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -2071,6 +2079,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "spider-core",
+ "spider-dag",
  "spider-derive",
  "spider-proto-rust",
  "spider-tdl",

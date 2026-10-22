@@ -25,6 +25,7 @@ dashmap = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 spider-core = { workspace = true }
+spider-dag = { workspace = true }
 spider-derive = { workspace = true }
 spider-proto-rust = { workspace = true }
 spider-tdl = { workspace = true }
