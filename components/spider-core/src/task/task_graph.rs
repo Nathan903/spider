@@ -405,8 +405,9 @@ pub struct TerminationTaskDescriptor {
 pub struct TaskGraph {
     dataflow_deps: Vec<DataflowDependency>,
     tasks: Vec<Task>,
-    // Keep an independently verified topology witness for every production graph.
-    // Origin Rust: <none; new executable field>
+    /* Keep an independently verified topology witness for every production graph.
+     * Origin Rust: <none; new executable field>
+     */
     topology: Dag,
     commit_task: Option<TerminationTaskDescriptor>,
     cleanup_task: Option<TerminationTaskDescriptor>,
@@ -485,14 +486,15 @@ impl TaskGraph {
         {
             policy.validate()?;
         }
-        // Initialize the proof-carrying topology witness with the task storage it mirrors.
-        // Origin Rust:
-        // Ok(Self {
-        //     dataflow_deps: Vec::new(),
-        //     tasks: Vec::new(),
-        //     commit_task,
-        //     cleanup_task,
-        // })
+        /* Initialize the proof-carrying topology witness with the task storage it mirrors.
+         * Origin Rust:
+         * Ok(Self {
+         *     dataflow_deps: Vec::new(),
+         *     tasks: Vec::new(),
+         *     commit_task,
+         *     cleanup_task,
+         * })
+         */
         Ok(Self {
             dataflow_deps: Vec::new(),
             tasks: Vec::new(),
@@ -579,8 +581,10 @@ impl TaskGraph {
                 task_descriptor.input_sources,
             )?;
 
-        // Record the same parent relation in the verified topology kernel before publishing the
-        // task. Origin Rust: <none; new executable code>
+        /* Record the same parent relation in the verified topology kernel before publishing the
+         * task.
+         * Origin Rust: <none; new executable code>
+         */
         let topology_task_idx = self
             .topology
             .insert_task(&parent_indices)

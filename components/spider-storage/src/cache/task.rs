@@ -344,20 +344,21 @@ impl SharedTaskControlBlock {
             let mut ready_child_indices = Vec::new();
             for child in &tcb.children {
                 let mut child_tcb = child.inner.lock().await;
-                // Use the verified readiness transition instead of updating the counter locally.
-                // Origin Rust:
-                // if child_tcb.num_unfinished_parents == 0 {
-                //     return Err(InternalError::TaskGraphCorrupted(
-                //         "child task has no unfinished parents remaining when processing parent \
-                //          completion"
-                //             .to_owned(),
-                //     )
-                //     .into());
-                // }
-                // child_tcb.num_unfinished_parents -= 1;
-                // if child_tcb.num_unfinished_parents != 0 {
-                //     continue;
-                // }
+                /* Use the verified readiness transition instead of updating the counter locally.
+                 * Origin Rust:
+                 * if child_tcb.num_unfinished_parents == 0 {
+                 *     return Err(InternalError::TaskGraphCorrupted(
+                 *         "child task has no unfinished parents remaining when processing parent \
+                 *          completion"
+                 *             .to_owned(),
+                 *     )
+                 *     .into());
+                 * }
+                 * child_tcb.num_unfinished_parents -= 1;
+                 * if child_tcb.num_unfinished_parents != 0 {
+                 *     continue;
+                 * }
+                 */
                 match child_tcb.readiness.parent_completed() {
                     ParentCompletion::AlreadyReady => {
                         return Err(InternalError::TaskGraphCorrupted(
@@ -428,14 +429,15 @@ impl SharedTaskControlBlock {
         let mut tcb = self.inner.lock().await;
         tcb.base.instance_pool.reset();
         tcb.base.retry_counter.reset();
-        // Reset the verified readiness state and derive the runtime state from it.
-        // Origin Rust:
-        // tcb.num_unfinished_parents = tcb.num_parents;
-        // tcb.base.state = if tcb.num_parents == 0 {
-        //     TaskState::Ready
-        // } else {
-        //     TaskState::Pending
-        // };
+        /* Reset the verified readiness state and derive the runtime state from it.
+         * Origin Rust:
+         * tcb.num_unfinished_parents = tcb.num_parents;
+         * tcb.base.state = if tcb.num_parents == 0 {
+         *     TaskState::Ready
+         * } else {
+         *     TaskState::Pending
+         * };
+         */
         tcb.readiness.reset();
         tcb.base.state = if tcb.readiness.is_ready() {
             TaskState::Ready
@@ -490,13 +492,14 @@ impl SharedTaskControlBlock {
     ) -> Result<Self, InternalError> {
         let index = task.get_index();
         let num_parents = task.get_parent_indices().len();
-        // Make the verified readiness kernel authoritative for initial readiness.
-        // Origin Rust:
-        // let state = if num_parents == 0 {
-        //     TaskState::Ready
-        // } else {
-        //     TaskState::Pending
-        // };
+        /* Make the verified readiness kernel authoritative for initial readiness.
+         * Origin Rust:
+         * let state = if num_parents == 0 {
+         *     TaskState::Ready
+         * } else {
+         *     TaskState::Pending
+         * };
+         */
         let readiness = TaskReadiness::new(num_parents);
         let state = if readiness.is_ready() {
             TaskState::Ready
@@ -567,10 +570,11 @@ impl SharedTaskControlBlock {
                 timeout_policy,
             },
             index,
-            // Store the verified readiness state instead of duplicate parent counters.
-            // Origin Rust:
-            // num_parents,
-            // num_unfinished_parents: num_parents,
+            /* Store the verified readiness state instead of duplicate parent counters.
+             * Origin Rust:
+             * num_parents,
+             * num_unfinished_parents: num_parents,
+             */
             readiness,
             children,
             inputs: input_readers,
@@ -964,10 +968,11 @@ impl TaskControlBlockBase {
 struct TaskControlBlock {
     base: TaskControlBlockBase,
     index: TaskIndex,
-    // Keep graph-readiness state in the verified kernel.
-    // Origin Rust:
-    // num_parents: usize,
-    // num_unfinished_parents: usize,
+    /* Keep graph-readiness state in the verified kernel.
+     * Origin Rust:
+     * num_parents: usize,
+     * num_unfinished_parents: usize,
+     */
     readiness: TaskReadiness,
     children: Vec<SharedTaskControlBlock>,
     inputs: Vec<InputReader>,
