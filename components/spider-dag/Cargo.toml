@@ -7,5 +7,14 @@ edition = { workspace = true }
 name = "spider_dag"
 path = "src/lib.rs"
 
+[dependencies]
+vstd = "=0.0.0-2026-04-20-1748"
+
 [dev-dependencies]
 anyhow = { workspace = true }
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }
