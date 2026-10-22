@@ -566,138 +566,354 @@ impl Dag {
 /// The result of recording one parent task's successful completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParentCompletion {
-    AlreadyReady,
+    AlreadyCompleted,
     BecameReady,
     StillPending,
+    UnknownParent,
 }
 
-/// Tracks the unique unfinished parents of one task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Tracks which parents of one task have completed successfully.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskReadiness {
-    num_parents: usize,
-    num_unfinished_parents: usize,
+    parent_indices: Vec<usize>,
+    completed: Vec<bool>,
 }
 
 impl TaskReadiness {
     /// # Returns
     ///
-    /// The mathematical number of unique parent tasks.
-    pub closed spec fn num_parents_spec(&self) -> usize {
-        self.num_parents
+    /// The mathematical parent task indices.
+    pub closed spec fn parent_indices_spec(&self) -> Seq<usize> {
+        self.parent_indices@
     }
 
     /// # Returns
     ///
-    /// The mathematical number of unfinished parent tasks.
-    pub closed spec fn num_unfinished_parents_spec(&self) -> usize {
-        self.num_unfinished_parents
+    /// Whether `parent` is a parent task whose successful completion has been recorded.
+    pub closed spec fn has_completed_spec(&self, parent: usize) -> bool {
+        exists|position: int|
+            0 <= position < self.parent_indices@.len() && #[trigger] self.parent_indices@[position]
+                == parent && self.completed@[position]
     }
 
     /// # Returns
     ///
-    /// Whether the unfinished-parent count is bounded by the original parent count.
+    /// Whether every parent task's successful completion has been recorded.
+    pub closed spec fn is_ready_spec(&self) -> bool {
+        forall|parent: usize|
+            self.parent_indices@.contains(parent) ==> #[trigger] self.has_completed_spec(parent)
+    }
+
+    /// # Returns
+    ///
+    /// Whether the completion flags match the parent list and agree for repeated parents.
     pub closed spec fn invariant(&self) -> bool {
-        self.num_unfinished_parents <= self.num_parents
+        &&& self.completed@.len() == self.parent_indices@.len()
+        &&& forall|left: int, right: int|
+            0 <= left < self.parent_indices@.len() && 0 <= right < self.parent_indices@.len()
+                && #[trigger] self.parent_indices@[left] == #[trigger] self.parent_indices@[right]
+                ==> self.completed@[left] == self.completed@[right]
     }
 
     /// Creates readiness state for a task.
     ///
     /// # Returns
     ///
-    /// Readiness state with every parent unfinished.
+    /// Readiness state with no parent completion recorded.
     #[must_use]
-    pub const fn new(num_parents: usize) -> (result: Self)
+    pub fn new(parent_indices: Vec<usize>) -> (result: Self)
         ensures
             result.invariant(),
-            result.num_parents_spec() == num_parents,
-            result.num_unfinished_parents_spec() == num_parents,
+            result.parent_indices_spec() == parent_indices@,
+            forall|parent: usize| !#[trigger] result.has_completed_spec(parent),
     {
+        let mut completed: Vec<bool> = Vec::with_capacity(parent_indices.len());
+        while completed.len() < parent_indices.len()
+            invariant
+                completed@.len() <= parent_indices@.len(),
+                forall|position: int|
+                    0 <= position < completed@.len() ==> !#[trigger] completed@[position],
+            decreases parent_indices.len() - completed.len()
+        {
+            completed.push(false);
+        }
         Self {
-            num_parents,
-            num_unfinished_parents: num_parents,
+            parent_indices,
+            completed,
         }
     }
 
-    /// Records one unique parent task's successful completion.
+    /// Records the successful completion of the parent task `parent`.
     ///
     /// # Returns
     ///
-    /// * [`ParentCompletion::AlreadyReady`] if no unfinished parent remains.
-    /// * [`ParentCompletion::BecameReady`] if this was the final unfinished parent.
-    /// * [`ParentCompletion::StillPending`] if another unfinished parent remains.
-    pub const fn parent_completed(&mut self) -> (result: ParentCompletion)
+    /// * [`ParentCompletion::UnknownParent`] if `parent` is not a parent of this task.
+    /// * [`ParentCompletion::AlreadyCompleted`] if the completion of `parent` was already recorded.
+    /// * [`ParentCompletion::BecameReady`] if `parent` was the last parent without a recorded
+    ///   completion.
+    /// * [`ParentCompletion::StillPending`] if another parent has no recorded completion.
+    pub fn parent_completed(&mut self, parent: usize) -> (result: ParentCompletion)
         requires
             old(self).invariant(),
         ensures
             final(self).invariant(),
-            final(self).num_parents_spec() == old(self).num_parents_spec(),
-            (result == ParentCompletion::AlreadyReady)
-                <==> old(self).num_unfinished_parents_spec() == 0,
-            (result == ParentCompletion::BecameReady)
-                <==> old(self).num_unfinished_parents_spec() == 1,
-            (result == ParentCompletion::StillPending)
-                <==> old(self).num_unfinished_parents_spec() > 1,
-            old(self).num_unfinished_parents_spec() == 0
-                ==> final(self).num_unfinished_parents_spec() == 0,
-            old(self).num_unfinished_parents_spec() > 0
-                ==> final(self).num_unfinished_parents_spec() + 1
-                    == old(self).num_unfinished_parents_spec(),
+            final(self).parent_indices_spec() == old(self).parent_indices_spec(),
+            forall|other: usize|
+                #[trigger] final(self).has_completed_spec(other) <==> old(self).has_completed_spec(other) || (other == parent && old(self).parent_indices_spec().contains(parent)),
+            (result == ParentCompletion::UnknownParent) <==> !old(self).parent_indices_spec().contains(parent),
+            (result == ParentCompletion::AlreadyCompleted) <==> old(self).has_completed_spec(parent),
+            (result == ParentCompletion::BecameReady) <==> !old(self).is_ready_spec() && final(self).is_ready_spec(),
+            (result == ParentCompletion::StillPending) <==> old(self).parent_indices_spec().contains(parent) && !old(self).has_completed_spec(parent)
+                && !final(self).is_ready_spec(),
     {
-        if self.num_unfinished_parents == 0 {
-            return ParentCompletion::AlreadyReady;
+        let mut found = false;
+        let mut newly_completed = false;
+        let ghost mut found_position: int = 0;
+        let ghost mut newly_completed_position: int = 0;
+        let mut position = 0;
+        while position < self.parent_indices.len()
+            invariant
+                old(self).invariant(),
+                self.parent_indices@ == old(self).parent_indices@,
+                self.completed@.len() == old(self).completed@.len(),
+                position <= self.parent_indices@.len(),
+                forall|index: int|
+                    0 <= index < position ==> #[trigger] self.completed@[index] == (old(self).completed@[index] || self.parent_indices@[index] == parent),
+                forall|index: int|
+                    position <= index < self.completed@.len() ==> #[trigger] self.completed@[index]
+                        == old(self).completed@[index],
+                found ==> 0 <= found_position < position && self.parent_indices@[found_position]
+                    == parent,
+                !found ==> forall|index: int|
+                    0 <= index < position ==> #[trigger] self.parent_indices@[index] != parent,
+                newly_completed ==> 0 <= newly_completed_position < position
+                    && self.parent_indices@[newly_completed_position] == parent
+                    && !old(self).completed@[newly_completed_position],
+                !newly_completed ==> forall|index: int|
+                    0 <= index < position && #[trigger] self.parent_indices@[index] == parent
+                        ==> old(self).completed@[index],
+            decreases self.parent_indices.len() - position
+        {
+            if self.parent_indices[position] == parent {
+                found = true;
+                proof {
+                    found_position = position as int;
+                }
+                if !self.completed[position] {
+                    newly_completed = true;
+                    proof {
+                        newly_completed_position = position as int;
+                    }
+                    self.completed[position] = true;
+                }
+            }
+            position += 1;
         }
 
-        self.num_unfinished_parents -= 1;
-        if self.num_unfinished_parents == 0 {
+        proof {
+            TaskReadiness::lemma_parent_completed(
+                old(self),
+                self,
+                parent,
+                found,
+                newly_completed,
+                found_position,
+                newly_completed_position,
+            );
+        }
+
+        if !found {
+            return ParentCompletion::UnknownParent;
+        }
+        if !newly_completed {
+            return ParentCompletion::AlreadyCompleted;
+        }
+        if self.is_ready() {
             ParentCompletion::BecameReady
         } else {
             ParentCompletion::StillPending
         }
     }
 
-    /// Restores the initial readiness state.
-    pub const fn reset(&mut self)
+    /// Clears every recorded parent completion.
+    pub fn reset(&mut self)
         requires
             old(self).invariant(),
         ensures
             final(self).invariant(),
-            final(self).num_parents_spec() == old(self).num_parents_spec(),
-            final(self).num_unfinished_parents_spec() == final(self).num_parents_spec(),
+            final(self).parent_indices_spec() == old(self).parent_indices_spec(),
+            forall|parent: usize| !#[trigger] final(self).has_completed_spec(parent),
     {
-        self.num_unfinished_parents = self.num_parents;
+        let mut position = 0;
+        while position < self.completed.len()
+            invariant
+                self.parent_indices@ == old(self).parent_indices@,
+                self.completed@.len() == old(self).completed@.len(),
+                old(self).invariant(),
+                position <= self.completed@.len(),
+                forall|index: int| 0 <= index < position ==> !#[trigger] self.completed@[index],
+            decreases self.completed.len() - position
+        {
+            self.completed[position] = false;
+            position += 1;
+        }
     }
 
     /// # Returns
     ///
-    /// Whether all parent tasks have completed successfully.
+    /// Whether every parent task has completed successfully.
     #[must_use]
-    pub const fn is_ready(&self) -> (result: bool)
+    pub fn is_ready(&self) -> (result: bool)
+        requires
+            self.invariant(),
         ensures
-            result == (self.num_unfinished_parents_spec() == 0),
+            result == self.is_ready_spec(),
     {
-        self.num_unfinished_parents == 0
+        let mut position = 0;
+        while position < self.completed.len()
+            invariant
+                self.invariant(),
+                position <= self.completed@.len(),
+                forall|index: int| 0 <= index < position ==> #[trigger] self.completed@[index],
+            decreases self.completed.len() - position
+        {
+            if !self.completed[position] {
+                proof {
+                    self.lemma_is_ready_iff_all_completed();
+                }
+                return false;
+            }
+            position += 1;
+        }
+        proof {
+            self.lemma_is_ready_iff_all_completed();
+        }
+        true
     }
 
-    /// # Returns
-    ///
-    /// The number of unique parent tasks.
-    #[must_use]
-    pub const fn num_parents(&self) -> (result: usize)
+    proof fn lemma_is_ready_iff_all_completed(&self)
+        requires
+            self.invariant(),
         ensures
-            result == self.num_parents_spec(),
+            self.is_ready_spec() <==> forall|position: int|
+                0 <= position < self.completed@.len() ==> #[trigger] self.completed@[position],
     {
-        self.num_parents
+        reveal(TaskReadiness::is_ready_spec);
+        reveal(TaskReadiness::has_completed_spec);
+        if forall|position: int|
+            0 <= position < self.completed@.len() ==> #[trigger] self.completed@[position] {
+            assert forall|parent: usize| self.parent_indices@.contains(parent) implies #[trigger] self.has_completed_spec(parent) by {
+                let position = choose|position: int|
+                    0 <= position < self.parent_indices@.len() && self.parent_indices@[position]
+                        == parent;
+                assert(self.completed@[position]);
+            }
+        }
+        if self.is_ready_spec() {
+            assert forall|position: int|
+                0 <= position < self.completed@.len() implies #[trigger] self.completed@[position] by {
+                let parent = self.parent_indices@[position];
+                assert(self.parent_indices@.contains(parent));
+                assert(self.has_completed_spec(parent));
+                let witness = choose|witness: int|
+                    0 <= witness < self.parent_indices@.len() && #[trigger] self.parent_indices@[witness]
+                        == parent && self.completed@[witness];
+                assert(self.completed@[witness] == self.completed@[position]);
+            }
+        }
     }
 
-    /// # Returns
-    ///
-    /// The number of unique parent tasks that have not completed successfully.
-    #[must_use]
-    pub const fn num_unfinished_parents(&self) -> (result: usize)
+    proof fn lemma_parent_completed(
+        old_self: &TaskReadiness,
+        new_self: &TaskReadiness,
+        parent: usize,
+        found: bool,
+        newly_completed: bool,
+        found_position: int,
+        newly_completed_position: int,
+    )
+        requires
+            old_self.invariant(),
+            new_self.parent_indices@ == old_self.parent_indices@,
+            new_self.completed@.len() == old_self.completed@.len(),
+            forall|index: int|
+                0 <= index < new_self.completed@.len() ==> #[trigger] new_self.completed@[index] == (old_self.completed@[index] || new_self.parent_indices@[index] == parent),
+            found ==> 0 <= found_position < new_self.parent_indices@.len()
+                && new_self.parent_indices@[found_position] == parent,
+            !found ==> forall|index: int|
+                0 <= index < new_self.parent_indices@.len() ==> #[trigger] new_self.parent_indices@[index] != parent,
+            newly_completed ==> 0 <= newly_completed_position < new_self.parent_indices@.len()
+                && new_self.parent_indices@[newly_completed_position] == parent
+                && !old_self.completed@[newly_completed_position],
+            !newly_completed ==> forall|index: int|
+                0 <= index < new_self.parent_indices@.len() && #[trigger] new_self.parent_indices@[index] == parent
+                    ==> old_self.completed@[index],
         ensures
-            result == self.num_unfinished_parents_spec(),
+            new_self.invariant(),
+            found == old_self.parent_indices@.contains(parent),
+            old_self.has_completed_spec(parent) == (found && !newly_completed),
+            forall|other: usize| #[trigger] new_self.has_completed_spec(other) <==> (old_self.has_completed_spec(other) || (other == parent && found)),
+            !newly_completed && new_self.is_ready_spec() ==> old_self.is_ready_spec(),
+            newly_completed ==> !old_self.is_ready_spec(),
     {
-        self.num_unfinished_parents
+        assert forall|left: int, right: int|
+            0 <= left < new_self.parent_indices@.len() && 0 <= right < new_self.parent_indices@.len()
+                && #[trigger] new_self.parent_indices@[left] == #[trigger] new_self.parent_indices@[right]
+        implies new_self.completed@[left] == new_self.completed@[right] by {
+            assert(old_self.completed@[left] == old_self.completed@[right]);
+        }
+        assert(found == old_self.parent_indices@.contains(parent)) by {
+            if found {
+                assert(old_self.parent_indices@[found_position] == parent);
+            }
+        }
+        if old_self.has_completed_spec(parent) {
+            let witness = choose|witness: int|
+                0 <= witness < old_self.parent_indices@.len()
+                    && #[trigger] old_self.parent_indices@[witness] == parent
+                    && old_self.completed@[witness];
+            assert(new_self.parent_indices@[witness] == parent);
+            if newly_completed {
+                assert(old_self.completed@[witness]
+                    == old_self.completed@[newly_completed_position]);
+            }
+        }
+        if found && !newly_completed {
+            assert(old_self.completed@[found_position]);
+            assert(old_self.parent_indices@[found_position] == parent);
+        }
+        assert forall|other: usize| #[trigger] new_self.has_completed_spec(other) <==> (old_self.has_completed_spec(other) || (other == parent && found)) by {
+            if new_self.has_completed_spec(other) {
+                let witness = choose|witness: int|
+                    0 <= witness < new_self.parent_indices@.len()
+                        && #[trigger] new_self.parent_indices@[witness] == other
+                        && new_self.completed@[witness];
+                assert(old_self.parent_indices@[witness] == other);
+            }
+            if old_self.has_completed_spec(other) {
+                let witness = choose|witness: int|
+                    0 <= witness < old_self.parent_indices@.len()
+                        && #[trigger] old_self.parent_indices@[witness] == other
+                        && old_self.completed@[witness];
+                assert(new_self.completed@[witness]);
+                assert(new_self.parent_indices@[witness] == other);
+            }
+            if other == parent && found {
+                assert(new_self.completed@[found_position]);
+                assert(new_self.parent_indices@[found_position] == other);
+            }
+        }
+        if !newly_completed && new_self.is_ready_spec() {
+            assert forall|other: usize| old_self.parent_indices@.contains(other) implies #[trigger] old_self.has_completed_spec(other) by {
+                assert(new_self.parent_indices@.contains(other));
+                assert(new_self.has_completed_spec(other));
+            }
+        }
+        if newly_completed {
+            assert(old_self.parent_indices@[newly_completed_position] == parent);
+            assert(old_self.parent_indices@.contains(parent));
+            assert(!old_self.has_completed_spec(parent));
+        }
     }
 }
 
@@ -801,35 +1017,109 @@ mod tests {
         Ok(())
     }
 
+    /// # Returns
+    ///
+    /// Every sequence of length at most `max_len` whose elements are below `num_values`.
+    fn all_sequences(num_values: usize, max_len: usize) -> Vec<Vec<usize>> {
+        let mut sequences = vec![Vec::new()];
+        let mut previous_level = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut level = Vec::new();
+            for prefix in &previous_level {
+                for value in 0..num_values {
+                    let mut sequence = prefix.clone();
+                    sequence.push(value);
+                    level.push(sequence);
+                }
+            }
+            sequences.extend(level.iter().cloned());
+            previous_level = level;
+        }
+        sequences
+    }
+
     #[test]
-    fn becomes_ready_after_final_parent() {
-        let mut readiness = TaskReadiness::new(3);
+    fn becomes_ready_after_every_distinct_parent() {
+        let mut readiness = TaskReadiness::new(vec![4, 7, 9]);
         assert!(!readiness.is_ready());
-        assert_eq!(readiness.parent_completed(), ParentCompletion::StillPending);
-        assert_eq!(readiness.parent_completed(), ParentCompletion::StillPending);
-        assert_eq!(readiness.parent_completed(), ParentCompletion::BecameReady);
+        assert_eq!(
+            readiness.parent_completed(7),
+            ParentCompletion::StillPending
+        );
+        assert_eq!(
+            readiness.parent_completed(7),
+            ParentCompletion::AlreadyCompleted
+        );
+        assert!(!readiness.is_ready());
+        assert_eq!(
+            readiness.parent_completed(4),
+            ParentCompletion::StillPending
+        );
+        assert_eq!(readiness.parent_completed(9), ParentCompletion::BecameReady);
         assert!(readiness.is_ready());
-        assert_eq!(readiness.parent_completed(), ParentCompletion::AlreadyReady);
+        assert_eq!(
+            readiness.parent_completed(4),
+            ParentCompletion::AlreadyCompleted
+        );
+        assert_eq!(
+            readiness.parent_completed(5),
+            ParentCompletion::UnknownParent
+        );
     }
 
     #[test]
     fn reset_restores_initial_readiness() {
-        let mut input_task = TaskReadiness::new(0);
+        let mut input_task = TaskReadiness::new(Vec::new());
         assert!(input_task.is_ready());
         assert_eq!(
-            input_task.parent_completed(),
-            ParentCompletion::AlreadyReady
+            input_task.parent_completed(0),
+            ParentCompletion::UnknownParent
         );
         input_task.reset();
         assert!(input_task.is_ready());
 
-        let mut dependent_task = TaskReadiness::new(2);
+        let mut dependent_task = TaskReadiness::new(vec![0, 1]);
         assert_eq!(
-            dependent_task.parent_completed(),
+            dependent_task.parent_completed(0),
             ParentCompletion::StillPending
         );
         dependent_task.reset();
-        assert_eq!(dependent_task.num_unfinished_parents(), 2);
         assert!(!dependent_task.is_ready());
+        assert_eq!(
+            dependent_task.parent_completed(0),
+            ParentCompletion::StillPending
+        );
+    }
+
+    #[test]
+    fn exhaustively_matches_parent_set_model() {
+        const NUM_TASKS: usize = 4;
+        for parents in all_sequences(NUM_TASKS - 1, 3) {
+            for completions in all_sequences(NUM_TASKS, 4) {
+                let mut readiness = TaskReadiness::new(parents.clone());
+                let mut completed = std::collections::BTreeSet::new();
+                for &parent in &completions {
+                    let expected = if !parents.contains(&parent) {
+                        ParentCompletion::UnknownParent
+                    } else if !completed.insert(parent) {
+                        ParentCompletion::AlreadyCompleted
+                    } else if parents.iter().all(|parent| completed.contains(parent)) {
+                        ParentCompletion::BecameReady
+                    } else {
+                        ParentCompletion::StillPending
+                    };
+                    assert_eq!(
+                        readiness.parent_completed(parent),
+                        expected,
+                        "parents {parents:?}, completions {completions:?}"
+                    );
+                    assert_eq!(
+                        readiness.is_ready(),
+                        parents.iter().all(|parent| completed.contains(parent)),
+                        "parents {parents:?}, completions {completions:?}"
+                    );
+                }
+            }
+        }
     }
 }
