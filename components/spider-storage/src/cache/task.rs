@@ -15,6 +15,8 @@ use spider_core::types::io::ExecutionContext;
 use spider_core::types::io::TaskGraphInput;
 use spider_core::types::io::TaskInputsSerializer;
 use spider_core::types::io::TaskOutput;
+use spider_dag::ParentCompletion;
+use spider_dag::TaskReadiness;
 use tokio::sync::RwLock;
 
 use crate::cache::error::CacheError;
@@ -445,8 +447,8 @@ impl SharedTaskControlBlock {
     /// * [`CacheError::TaskOutputsLengthMismatch`] if the number of task outputs doesn't match the
     ///   number of outputs of the task.
     /// * [`InternalError::TaskGraphCorrupted`] if:
-    ///   * Attempting to mark a parent of a child task as completed, but the child task's
-    ///     unfinished parent counter is already 0.
+    ///   * The completed task is not listed as a parent of one of its child tasks.
+    ///   * The child task has already recorded the completion of this parent task.
     ///   * Attempting to update a child task after parent completion, but the child task is already
     ///     in a terminal state.
     /// * Forwards [`TaskControlBlockBase::succeed_task_instance`]'s return values on failure.
@@ -483,17 +485,38 @@ impl SharedTaskControlBlock {
             let mut ready_child_indices = Vec::new();
             for child in &tcb.children {
                 let mut child_tcb = child.inner.lock().await;
-                if child_tcb.num_unfinished_parents == 0 {
-                    return Err(InternalError::TaskGraphCorrupted(
-                        "child task has no unfinished parents remaining when processing parent \
-                         completion"
-                            .to_owned(),
-                    )
-                    .into());
-                }
-                child_tcb.num_unfinished_parents -= 1;
-                if child_tcb.num_unfinished_parents != 0 {
-                    continue;
+                /* Record which parent completed so that a repeated completion of one parent cannot
+                 * stand in for another parent.
+                 * Origin Rust:
+                 * if child_tcb.num_unfinished_parents == 0 {
+                 *     return Err(InternalError::TaskGraphCorrupted(
+                 *         "child task has no unfinished parents remaining when processing parent \
+                 *          completion"
+                 *             .to_owned(),
+                 *     )
+                 *     .into());
+                 * }
+                 * child_tcb.num_unfinished_parents -= 1;
+                 * if child_tcb.num_unfinished_parents != 0 {
+                 *     continue;
+                 * }
+                 */
+                match child_tcb.readiness.parent_completed(tcb.index) {
+                    ParentCompletion::UnknownParent => {
+                        return Err(InternalError::TaskGraphCorrupted(
+                            "child task does not list the completed task as a parent".to_owned(),
+                        )
+                        .into());
+                    }
+                    ParentCompletion::AlreadyCompleted => {
+                        return Err(InternalError::TaskGraphCorrupted(
+                            "child task has already recorded the completion of this parent task"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                    ParentCompletion::StillPending => continue,
+                    ParentCompletion::BecameReady => {}
                 }
 
                 // In practice, this update is guarded by a read lock on the task graph, which
@@ -553,8 +576,17 @@ impl SharedTaskControlBlock {
         let mut tcb = self.inner.lock().await;
         tcb.base.instance_pool.reset();
         tcb.base.retry_counter.reset();
-        tcb.num_unfinished_parents = tcb.num_parents;
-        tcb.base.state = if tcb.num_parents == 0 {
+        /* Reset the verified readiness state and derive the runtime state from it.
+         * Origin Rust:
+         * tcb.num_unfinished_parents = tcb.num_parents;
+         * tcb.base.state = if tcb.num_parents == 0 {
+         *     TaskState::Ready
+         * } else {
+         *     TaskState::Pending
+         * };
+         */
+        tcb.readiness.reset();
+        tcb.base.state = if tcb.readiness.is_ready() {
             TaskState::Ready
         } else {
             TaskState::Pending
@@ -607,8 +639,18 @@ impl SharedTaskControlBlock {
         dataflow_dep_buffer: &[SharedRw<ValuePayload>],
     ) -> Result<Self, InternalError> {
         let index = task.get_index();
-        let num_parents = task.get_parent_indices().len();
-        let state = if num_parents == 0 {
+        /* Make the verified readiness kernel, which tracks parent identities, authoritative for
+         * initial readiness.
+         * Origin Rust:
+         * let num_parents = task.get_parent_indices().len();
+         * let state = if num_parents == 0 {
+         *     TaskState::Ready
+         * } else {
+         *     TaskState::Pending
+         * };
+         */
+        let readiness = TaskReadiness::new(task.get_parent_indices().clone());
+        let state = if readiness.is_ready() {
             TaskState::Ready
         } else {
             TaskState::Pending
@@ -677,8 +719,12 @@ impl SharedTaskControlBlock {
                 timeout_policy,
             },
             index,
-            num_parents,
-            num_unfinished_parents: num_parents,
+            /* Store the verified readiness state instead of duplicate parent counters.
+             * Origin Rust:
+             * num_parents,
+             * num_unfinished_parents: num_parents,
+             */
+            readiness,
             children,
             inputs: input_readers,
             outputs: output_writers,
@@ -1098,8 +1144,12 @@ impl TaskControlBlockBase {
 struct TaskControlBlock {
     base: TaskControlBlockBase,
     index: TaskIndex,
-    num_parents: usize,
-    num_unfinished_parents: usize,
+    /* Keep graph-readiness state in the verified kernel.
+     * Origin Rust:
+     * num_parents: usize,
+     * num_unfinished_parents: usize,
+     */
+    readiness: TaskReadiness,
     children: Vec<SharedTaskControlBlock>,
     inputs: Vec<InputReader>,
     outputs: Vec<OutputWriter>,
@@ -1179,6 +1229,7 @@ mod tests {
     use spider_core::task::ExecutionPolicy;
     use spider_core::task::TaskDescriptor;
     use spider_core::task::TaskGraph as SubmittedTaskGraph;
+    use spider_core::task::TaskInputOutputIndex;
     use spider_core::task::TerminationTaskDescriptor;
     use spider_core::task::ValueTypeDescriptor;
     use spider_core::types::id::JobId;
@@ -2005,6 +2056,72 @@ mod tests {
         );
 
         assert_graph_outputs(&task_graph, &[expected.d_output]).await;
+    }
+
+    /// Completing one parent twice must not stand in for a different parent that has not run.
+    #[tokio::test]
+    async fn repeated_parent_completion_does_not_make_child_ready() -> anyhow::Result<()> {
+        let bytes_type = DataTypeDescriptor::Value(ValueTypeDescriptor::bytes());
+        let root_task = |task_func: &str| TaskDescriptor {
+            tdl_context: TdlContext {
+                package: "test_pkg".to_owned(),
+                task_func: task_func.to_owned(),
+            },
+            execution_policy: None,
+            inputs: vec![],
+            outputs: vec![bytes_type.clone()],
+            input_sources: None,
+        };
+        let mut submitted = SubmittedTaskGraph::new(None, None)?;
+        submitted.insert_task(root_task("parent_a"))?;
+        submitted.insert_task(root_task("parent_b"))?;
+        submitted.insert_task(TaskDescriptor {
+            tdl_context: TdlContext {
+                package: "test_pkg".to_owned(),
+                task_func: "child".to_owned(),
+            },
+            execution_policy: None,
+            inputs: vec![bytes_type.clone(), bytes_type.clone()],
+            outputs: vec![],
+            input_sources: Some(vec![
+                TaskInputOutputIndex {
+                    task_idx: 0,
+                    position: 0,
+                },
+                TaskInputOutputIndex {
+                    task_idx: 1,
+                    position: 0,
+                },
+            ]),
+        })?;
+        let task_graph = TaskGraph::create(create_validated_submission(
+            submitted,
+            TaskGraphInputBuilder::new().build(),
+        ))
+        .await?;
+        let parent_a = task_graph
+            .get_task_control_block(0)
+            .expect("parent A should exist");
+
+        let first_id = next_instance_id();
+        parent_a.register_task_instance(first_id).await?;
+        let first_ready = succeed_instance(&parent_a, first_id, vec![vec![1]]).await?;
+        assert_eq!(first_ready, Vec::<TaskIndex>::new());
+
+        parent_a.reset().await;
+        let second_id = next_instance_id();
+        parent_a.register_task_instance(second_id).await?;
+        let second_result = succeed_instance(&parent_a, second_id, vec![vec![2]]).await;
+        assert!(
+            matches!(
+                second_result,
+                Err(CacheError::Internal(InternalError::TaskGraphCorrupted(_)))
+            ),
+            "repeated parent completion should be rejected, got: {second_result:?}"
+        );
+
+        assert_eq!(task_graph.get_all_ready_task_indices().await, vec![1]);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

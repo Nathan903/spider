@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "components/spider-client",
   "components/spider-core",
+  "components/spider-dag",
   "components/spider-derive",
   "components/spider-execution-manager",
   "components/spider-proto-rust",
@@ -26,6 +27,7 @@ members = [
 default-members = [
   "components/spider-client",
   "components/spider-core",
+  "components/spider-dag",
   "components/spider-derive",
   "components/spider-execution-manager",
   "components/spider-proto-rust",
@@ -70,6 +72,7 @@ serial_test = { version = "3.5.0", features = ["file_locks"] }
 slotmap = "1.1.1"
 spider-client = { path = "components/spider-client" }
 spider-core = { path = "components/spider-core" }
+spider-dag = { path = "components/spider-dag" }
 spider-derive = { path = "components/spider-derive" }
 spider-execution-manager = { path = "components/spider-execution-manager" }
 spider-proto-rust = { path = "components/spider-proto-rust" }

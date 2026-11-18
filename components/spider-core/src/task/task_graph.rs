@@ -8,6 +8,7 @@ use serde::de::{self};
 use serde::ser::SerializeMap;
 use serde::ser::SerializeSeq;
 use serde::ser::Serializer;
+use spider_dag::Dag;
 use strum::AsRefStr;
 use strum::EnumCount;
 use strum::EnumIter;
@@ -404,6 +405,10 @@ pub struct TerminationTaskDescriptor {
 pub struct TaskGraph {
     dataflow_deps: Vec<DataflowDependency>,
     tasks: Vec<Task>,
+    /* Keep an independently verified topology witness for every production graph.
+     * Origin Rust: <none; new executable field>
+     */
+    topology: Dag,
     commit_task: Option<TerminationTaskDescriptor>,
     cleanup_task: Option<TerminationTaskDescriptor>,
 }
@@ -481,9 +486,19 @@ impl TaskGraph {
         {
             policy.validate()?;
         }
+        /* Initialize the proof-carrying topology witness with the task storage it mirrors.
+         * Origin Rust:
+         * Ok(Self {
+         *     dataflow_deps: Vec::new(),
+         *     tasks: Vec::new(),
+         *     commit_task,
+         *     cleanup_task,
+         * })
+         */
         Ok(Self {
             dataflow_deps: Vec::new(),
             tasks: Vec::new(),
+            topology: Dag::new(),
             commit_task,
             cleanup_task,
         })
@@ -548,6 +563,11 @@ impl TaskGraph {
     ///
     /// * Forwards [`ExecutionPolicy::validate`]'s return values on failure.
     /// * Forwards [`Self::compute_and_update_dependencies_from_inputs`]'s return values on failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the computed parent indices violate the DAG topology invariant or if the topology
+    /// witness's next task index differs from the task storage's next index.
     pub fn insert_task(&mut self, task_descriptor: TaskDescriptor) -> Result<TaskIndex, Error> {
         if let Some(execution_policy) = &task_descriptor.execution_policy {
             execution_policy.validate()?;
@@ -560,6 +580,16 @@ impl TaskGraph {
                 &task_descriptor.inputs,
                 task_descriptor.input_sources,
             )?;
+
+        /* Record the same parent relation in the verified topology kernel before publishing the
+         * task.
+         * Origin Rust: <none; new executable code>
+         */
+        let topology_task_idx = self
+            .topology
+            .insert_task(&parent_indices)
+            .expect("computed parent indices must form a valid DAG");
+        assert_eq!(topology_task_idx, task_idx);
 
         let mut output_dep_indices: Vec<DataflowDependencyIndex> = Vec::new();
         for (position, output_type) in task_descriptor.outputs.into_iter().enumerate() {
