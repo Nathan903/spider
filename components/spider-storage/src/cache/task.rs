@@ -15,6 +15,8 @@ use spider_core::types::io::ExecutionContext;
 use spider_core::types::io::TaskGraphInput;
 use spider_core::types::io::TaskInputsSerializer;
 use spider_core::types::io::TaskOutput;
+use spider_dag::ParentCompletion;
+use spider_dag::TaskReadiness;
 use tokio::sync::RwLock;
 
 use crate::cache::error::CacheError;
@@ -483,17 +485,17 @@ impl SharedTaskControlBlock {
             let mut ready_child_indices = Vec::new();
             for child in &tcb.children {
                 let mut child_tcb = child.inner.lock().await;
-                if child_tcb.num_unfinished_parents == 0 {
-                    return Err(InternalError::TaskGraphCorrupted(
-                        "child task has no unfinished parents remaining when processing parent \
-                         completion"
-                            .to_owned(),
-                    )
-                    .into());
-                }
-                child_tcb.num_unfinished_parents -= 1;
-                if child_tcb.num_unfinished_parents != 0 {
-                    continue;
+                match child_tcb.readiness.parent_completed() {
+                    ParentCompletion::AlreadyReady => {
+                        return Err(InternalError::TaskGraphCorrupted(
+                            "child task has no unfinished parents remaining when processing \
+                             parent completion"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                    ParentCompletion::StillPending => continue,
+                    ParentCompletion::BecameReady => {}
                 }
 
                 // In practice, this update is guarded by a read lock on the task graph, which
@@ -590,8 +592,8 @@ impl SharedTaskControlBlock {
         dataflow_dep_buffer: &[SharedRw<ValuePayload>],
     ) -> Result<Self, InternalError> {
         let index = task.get_index();
-        let num_parents = task.get_parent_indices().len();
-        let state = if num_parents == 0 {
+        let readiness = TaskReadiness::new(task.get_parent_indices().len());
+        let state = if readiness.is_ready() {
             TaskState::Ready
         } else {
             TaskState::Pending
@@ -660,7 +662,7 @@ impl SharedTaskControlBlock {
                 timeout_policy,
             },
             index,
-            num_unfinished_parents: num_parents,
+            readiness,
             children,
             inputs: input_readers,
             outputs: output_writers,
@@ -1070,7 +1072,7 @@ impl TaskControlBlockBase {
 struct TaskControlBlock {
     base: TaskControlBlockBase,
     index: TaskIndex,
-    num_unfinished_parents: usize,
+    readiness: TaskReadiness,
     children: Vec<SharedTaskControlBlock>,
     inputs: Vec<InputReader>,
     outputs: Vec<OutputWriter>,

@@ -8,6 +8,7 @@ use serde::de::{self};
 use serde::ser::SerializeMap;
 use serde::ser::SerializeSeq;
 use serde::ser::Serializer;
+use spider_dag::Dag;
 use strum::AsRefStr;
 use strum::EnumCount;
 use strum::EnumIter;
@@ -404,6 +405,8 @@ pub struct TerminationTaskDescriptor {
 pub struct TaskGraph {
     dataflow_deps: Vec<DataflowDependency>,
     tasks: Vec<Task>,
+    // The parent relation of `tasks`, recorded in the formally verified DAG kernel.
+    topology: Dag,
     commit_task: Option<TerminationTaskDescriptor>,
     cleanup_task: Option<TerminationTaskDescriptor>,
 }
@@ -484,6 +487,7 @@ impl TaskGraph {
         Ok(Self {
             dataflow_deps: Vec::new(),
             tasks: Vec::new(),
+            topology: Dag::new(),
             commit_task,
             cleanup_task,
         })
@@ -548,6 +552,11 @@ impl TaskGraph {
     ///
     /// * Forwards [`ExecutionPolicy::validate`]'s return values on failure.
     /// * Forwards [`Self::compute_and_update_dependencies_from_inputs`]'s return values on failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Dag::insert_task`] rejects the computed parent indices or assigns a task index
+    /// that differs from `tasks`.
     pub fn insert_task(&mut self, task_descriptor: TaskDescriptor) -> Result<TaskIndex, Error> {
         if let Some(execution_policy) = &task_descriptor.execution_policy {
             execution_policy.validate()?;
@@ -560,6 +569,12 @@ impl TaskGraph {
                 &task_descriptor.inputs,
                 task_descriptor.input_sources,
             )?;
+
+        let topology_task_idx = self
+            .topology
+            .insert_task(&parent_indices)
+            .expect("computed parent indices must form a valid DAG");
+        assert_eq!(topology_task_idx, task_idx);
 
         let mut output_dep_indices: Vec<DataflowDependencyIndex> = Vec::new();
         for (position, output_type) in task_descriptor.outputs.into_iter().enumerate() {

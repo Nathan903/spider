@@ -1,0 +1,11 @@
+[package]
+name = "spider-dag"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "spider_dag"
+path = "src/lib.rs"
+
+[dev-dependencies]
+anyhow = { workspace = true }
