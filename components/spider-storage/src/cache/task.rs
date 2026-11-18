@@ -548,23 +548,6 @@ impl SharedTaskControlBlock {
         tcb.base.force_remove_task_instance(instance_id)
     }
 
-    /// Resets the task control block to the initial state.
-    pub async fn reset(&self) {
-        let mut tcb = self.inner.lock().await;
-        tcb.base.instance_pool.reset();
-        tcb.base.retry_counter.reset();
-        tcb.num_unfinished_parents = tcb.num_parents;
-        tcb.base.state = if tcb.num_parents == 0 {
-            TaskState::Ready
-        } else {
-            TaskState::Pending
-        };
-        for output_writer in &tcb.outputs {
-            *output_writer.write().await = None;
-        }
-        tcb.prepared_children.clear();
-    }
-
     /// Marks the TCB state cancelled.
     pub async fn cancel_non_terminal(&self) {
         let mut tcb = self.inner.lock().await;
@@ -677,7 +660,6 @@ impl SharedTaskControlBlock {
                 timeout_policy,
             },
             index,
-            num_parents,
             num_unfinished_parents: num_parents,
             children,
             inputs: input_readers,
@@ -878,15 +860,10 @@ impl InstancePool {
     fn is_empty(&self) -> bool {
         self.instance_ids.is_empty()
     }
-
-    fn reset(&mut self) {
-        self.instance_ids.clear();
-    }
 }
 
 /// A counter for tracking the number of retries left for a task.
 struct RetryCounter {
-    max_num_retries_allowed: usize,
     retry_count: usize,
 }
 
@@ -898,7 +875,6 @@ impl RetryCounter {
     /// A newly created instance of [`RetryCounter`].
     const fn new(max_num_retries_allowed: usize) -> Self {
         Self {
-            max_num_retries_allowed,
             retry_count: max_num_retries_allowed,
         }
     }
@@ -916,10 +892,6 @@ impl RetryCounter {
         let num_retries_left = self.retry_count;
         self.retry_count -= 1;
         num_retries_left
-    }
-
-    const fn reset(&mut self) {
-        self.retry_count = self.max_num_retries_allowed;
     }
 }
 
@@ -1098,7 +1070,6 @@ impl TaskControlBlockBase {
 struct TaskControlBlock {
     base: TaskControlBlockBase,
     index: TaskIndex,
-    num_parents: usize,
     num_unfinished_parents: usize,
     children: Vec<SharedTaskControlBlock>,
     inputs: Vec<InputReader>,
