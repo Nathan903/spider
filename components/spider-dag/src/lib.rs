@@ -1,8 +1,12 @@
 //! Runtime-free DAG construction and task-readiness primitives.
 
+use std::collections::BTreeSet;
+
 use vstd::prelude::*;
 
 verus! {
+
+broadcast use vstd::std_specs::btree::group_btree_axioms;
 
 /// An edge in a task graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -566,138 +570,227 @@ impl Dag {
 /// The result of recording one parent task's successful completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParentCompletion {
-    AlreadyReady,
+    AlreadyCompleted,
     BecameReady,
     StillPending,
+    UnknownParent,
 }
 
-/// Tracks the unique unfinished parents of one task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Tracks which parents of one task have completed successfully.
+#[derive(Debug, PartialEq, Eq)]
 pub struct TaskReadiness {
-    num_parents: usize,
-    num_unfinished_parents: usize,
+    parent_indices: Vec<usize>,
+    completed: BTreeSet<usize>,
 }
 
 impl TaskReadiness {
     /// # Returns
     ///
-    /// The mathematical number of unique parent tasks.
-    pub closed spec fn num_parents_spec(&self) -> usize {
-        self.num_parents
+    /// The mathematical parent task indices.
+    pub closed spec fn parent_indices_spec(&self) -> Seq<usize> {
+        self.parent_indices@
     }
 
     /// # Returns
     ///
-    /// The mathematical number of unfinished parent tasks.
-    pub closed spec fn num_unfinished_parents_spec(&self) -> usize {
-        self.num_unfinished_parents
+    /// Whether `parent` is a parent task whose successful completion has been recorded.
+    pub closed spec fn has_completed_spec(&self, parent: usize) -> bool {
+        self.completed@.contains(parent)
     }
 
     /// # Returns
     ///
-    /// Whether the unfinished-parent count is bounded by the original parent count.
+    /// Whether every parent task's successful completion has been recorded.
+    pub closed spec fn is_ready_spec(&self) -> bool {
+        forall|parent: usize|
+            self.parent_indices@.contains(parent) ==> #[trigger] self.has_completed_spec(parent)
+    }
+
+    /// # Returns
+    ///
+    /// Whether every recorded completion belongs to a parent task.
     pub closed spec fn invariant(&self) -> bool {
-        self.num_unfinished_parents <= self.num_parents
+        forall|parent: usize|
+            #[trigger] self.completed@.contains(parent) ==> self.parent_indices@.contains(parent)
     }
 
     /// Creates readiness state for a task.
     ///
     /// # Returns
     ///
-    /// Readiness state with every parent unfinished.
+    /// Readiness state with no parent completion recorded.
     #[must_use]
-    pub const fn new(num_parents: usize) -> (result: Self)
+    pub const fn new(parent_indices: Vec<usize>) -> (result: Self)
         ensures
             result.invariant(),
-            result.num_parents_spec() == num_parents,
-            result.num_unfinished_parents_spec() == num_parents,
+            result.parent_indices_spec() == parent_indices@,
+            forall|parent: usize| !#[trigger] result.has_completed_spec(parent),
     {
+        /* A set represents completed parent identities directly instead of synchronizing a flag for
+         * every parent-list position.
+         * Origin Rust:
+         * let mut completed: Vec<bool> = Vec::with_capacity(parent_indices.len());
+         * while completed.len() < parent_indices.len() {
+         *     completed.push(false);
+         * }
+         * Self { parent_indices, completed }
+         */
         Self {
-            num_parents,
-            num_unfinished_parents: num_parents,
+            parent_indices,
+            completed: BTreeSet::new(),
         }
     }
 
-    /// Records one unique parent task's successful completion.
+    /// Records the successful completion of the parent task `parent`.
     ///
     /// # Returns
     ///
-    /// * [`ParentCompletion::AlreadyReady`] if no unfinished parent remains.
-    /// * [`ParentCompletion::BecameReady`] if this was the final unfinished parent.
-    /// * [`ParentCompletion::StillPending`] if another unfinished parent remains.
-    pub const fn parent_completed(&mut self) -> (result: ParentCompletion)
+    /// * [`ParentCompletion::UnknownParent`] if `parent` is not a parent of this task.
+    /// * [`ParentCompletion::AlreadyCompleted`] if the completion of `parent` was already recorded.
+    /// * [`ParentCompletion::BecameReady`] if `parent` was the last parent without a recorded
+    ///   completion.
+    /// * [`ParentCompletion::StillPending`] if another parent has no recorded completion.
+    pub fn parent_completed(&mut self, parent: usize) -> (result: ParentCompletion)
         requires
             old(self).invariant(),
         ensures
             final(self).invariant(),
-            final(self).num_parents_spec() == old(self).num_parents_spec(),
-            (result == ParentCompletion::AlreadyReady)
-                <==> old(self).num_unfinished_parents_spec() == 0,
-            (result == ParentCompletion::BecameReady)
-                <==> old(self).num_unfinished_parents_spec() == 1,
-            (result == ParentCompletion::StillPending)
-                <==> old(self).num_unfinished_parents_spec() > 1,
-            old(self).num_unfinished_parents_spec() == 0
-                ==> final(self).num_unfinished_parents_spec() == 0,
-            old(self).num_unfinished_parents_spec() > 0
-                ==> final(self).num_unfinished_parents_spec() + 1
-                    == old(self).num_unfinished_parents_spec(),
+            final(self).parent_indices_spec() == old(self).parent_indices_spec(),
+            forall|other: usize|
+                #[trigger] final(self).has_completed_spec(other) <==> old(self).has_completed_spec(other) || (other == parent && old(self).parent_indices_spec().contains(parent)),
+            (result == ParentCompletion::UnknownParent) <==> !old(self).parent_indices_spec().contains(parent),
+            (result == ParentCompletion::AlreadyCompleted) <==> old(self).has_completed_spec(parent),
+            (result == ParentCompletion::BecameReady) <==> !old(self).is_ready_spec() && final(self).is_ready_spec(),
+            (result == ParentCompletion::StillPending) <==> old(self).parent_indices_spec().contains(parent) && !old(self).has_completed_spec(parent)
+                && !final(self).is_ready_spec(),
     {
-        if self.num_unfinished_parents == 0 {
-            return ParentCompletion::AlreadyReady;
+        /* `BTreeSet::insert` records the parent identity and reports a repeated completion in one
+         * operation.
+         * Origin Rust:
+         * let mut found = false;
+         * let mut newly_completed = false;
+         * let mut position = 0;
+         * while position < self.parent_indices.len() {
+         *     if self.parent_indices[position] == parent {
+         *         found = true;
+         *         if !self.completed[position] {
+         *             newly_completed = true;
+         *             self.completed[position] = true;
+         *         }
+         *     }
+         *     position += 1;
+         * }
+         * if !found { return ParentCompletion::UnknownParent; }
+         * if !newly_completed { return ParentCompletion::AlreadyCompleted; }
+         * if self.is_ready() {
+         *     ParentCompletion::BecameReady
+         * } else {
+         *     ParentCompletion::StillPending
+         * }
+         */
+        if !self.has_parent(parent) {
+            return ParentCompletion::UnknownParent;
         }
-
-        self.num_unfinished_parents -= 1;
-        if self.num_unfinished_parents == 0 {
+        if !self.completed.insert(parent) {
+            proof {
+                if self.is_ready_spec() {
+                    assert forall|other: usize| old(self).parent_indices@.contains(other)
+                        implies #[trigger] old(self).has_completed_spec(other) by {
+                        assert(self.has_completed_spec(other));
+                    }
+                }
+            }
+            return ParentCompletion::AlreadyCompleted;
+        }
+        if self.is_ready() {
             ParentCompletion::BecameReady
         } else {
             ParentCompletion::StillPending
         }
     }
 
-    /// Restores the initial readiness state.
-    pub const fn reset(&mut self)
+    /// Clears every recorded parent completion.
+    pub fn reset(&mut self)
         requires
             old(self).invariant(),
         ensures
             final(self).invariant(),
-            final(self).num_parents_spec() == old(self).num_parents_spec(),
-            final(self).num_unfinished_parents_spec() == final(self).num_parents_spec(),
+            final(self).parent_indices_spec() == old(self).parent_indices_spec(),
+            forall|parent: usize| !#[trigger] final(self).has_completed_spec(parent),
     {
-        self.num_unfinished_parents = self.num_parents;
+        /* Clearing the completed-parent set resets readiness without rewriting one flag per parent.
+         * Origin Rust:
+         * let mut position = 0;
+         * while position < self.completed.len() {
+         *     self.completed[position] = false;
+         *     position += 1;
+         * }
+         */
+        self.completed.clear();
     }
 
     /// # Returns
     ///
-    /// Whether all parent tasks have completed successfully.
+    /// Whether every parent task has completed successfully.
     #[must_use]
-    pub const fn is_ready(&self) -> (result: bool)
+    pub fn is_ready(&self) -> (result: bool)
+        requires
+            self.invariant(),
         ensures
-            result == (self.num_unfinished_parents_spec() == 0),
+            result == self.is_ready_spec(),
     {
-        self.num_unfinished_parents == 0
+        /* Readiness now checks parent identities in the completion set instead of parallel flags.
+         * Origin Rust:
+         * let mut position = 0;
+         * while position < self.completed.len() {
+         *     if !self.completed[position] { return false; }
+         *     position += 1;
+         * }
+         * true
+         */
+        let mut position = 0;
+        while position < self.parent_indices.len()
+            invariant
+                position <= self.parent_indices@.len(),
+                forall|index: int| 0 <= index < position ==>
+                    self.completed@.contains(#[trigger] self.parent_indices@[index]),
+            decreases self.parent_indices.len() - position
+        {
+            if !self.completed.contains(&self.parent_indices[position]) {
+                proof {
+                    assert(!self.has_completed_spec(self.parent_indices@[position as int]));
+                }
+                return false;
+            }
+            position += 1;
+        }
+        true
     }
 
     /// # Returns
     ///
-    /// The number of unique parent tasks.
-    #[must_use]
-    pub const fn num_parents(&self) -> (result: usize)
+    /// Whether `parent` is a parent task.
+    fn has_parent(&self, parent: usize) -> (result: bool)
         ensures
-            result == self.num_parents_spec(),
+            result == self.parent_indices@.contains(parent),
     {
-        self.num_parents
-    }
-
-    /// # Returns
-    ///
-    /// The number of unique parent tasks that have not completed successfully.
-    #[must_use]
-    pub const fn num_unfinished_parents(&self) -> (result: usize)
-        ensures
-            result == self.num_unfinished_parents_spec(),
-    {
-        self.num_unfinished_parents
+        /* The set-based completion update needs an executable membership check for the parent list.
+         * Origin Rust: <none; new executable code>
+         */
+        let mut position = 0;
+        while position < self.parent_indices.len()
+            invariant
+                position <= self.parent_indices@.len(),
+                forall|index: int| 0 <= index < position ==>
+                    #[trigger] self.parent_indices@[index] != parent,
+            decreases self.parent_indices.len() - position
+        {
+            if self.parent_indices[position] == parent {
+                return true;
+            }
+            position += 1;
+        }
+        false
     }
 }
 
@@ -801,35 +894,109 @@ mod tests {
         Ok(())
     }
 
+    /// # Returns
+    ///
+    /// Every sequence of length at most `max_len` whose elements are below `num_values`.
+    fn all_sequences(num_values: usize, max_len: usize) -> Vec<Vec<usize>> {
+        let mut sequences = vec![Vec::new()];
+        let mut previous_level = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut level = Vec::new();
+            for prefix in &previous_level {
+                for value in 0..num_values {
+                    let mut sequence = prefix.clone();
+                    sequence.push(value);
+                    level.push(sequence);
+                }
+            }
+            sequences.extend(level.iter().cloned());
+            previous_level = level;
+        }
+        sequences
+    }
+
     #[test]
-    fn becomes_ready_after_final_parent() {
-        let mut readiness = TaskReadiness::new(3);
+    fn becomes_ready_after_every_distinct_parent() {
+        let mut readiness = TaskReadiness::new(vec![4, 7, 9]);
         assert!(!readiness.is_ready());
-        assert_eq!(readiness.parent_completed(), ParentCompletion::StillPending);
-        assert_eq!(readiness.parent_completed(), ParentCompletion::StillPending);
-        assert_eq!(readiness.parent_completed(), ParentCompletion::BecameReady);
+        assert_eq!(
+            readiness.parent_completed(7),
+            ParentCompletion::StillPending
+        );
+        assert_eq!(
+            readiness.parent_completed(7),
+            ParentCompletion::AlreadyCompleted
+        );
+        assert!(!readiness.is_ready());
+        assert_eq!(
+            readiness.parent_completed(4),
+            ParentCompletion::StillPending
+        );
+        assert_eq!(readiness.parent_completed(9), ParentCompletion::BecameReady);
         assert!(readiness.is_ready());
-        assert_eq!(readiness.parent_completed(), ParentCompletion::AlreadyReady);
+        assert_eq!(
+            readiness.parent_completed(4),
+            ParentCompletion::AlreadyCompleted
+        );
+        assert_eq!(
+            readiness.parent_completed(5),
+            ParentCompletion::UnknownParent
+        );
     }
 
     #[test]
     fn reset_restores_initial_readiness() {
-        let mut input_task = TaskReadiness::new(0);
+        let mut input_task = TaskReadiness::new(Vec::new());
         assert!(input_task.is_ready());
         assert_eq!(
-            input_task.parent_completed(),
-            ParentCompletion::AlreadyReady
+            input_task.parent_completed(0),
+            ParentCompletion::UnknownParent
         );
         input_task.reset();
         assert!(input_task.is_ready());
 
-        let mut dependent_task = TaskReadiness::new(2);
+        let mut dependent_task = TaskReadiness::new(vec![0, 1]);
         assert_eq!(
-            dependent_task.parent_completed(),
+            dependent_task.parent_completed(0),
             ParentCompletion::StillPending
         );
         dependent_task.reset();
-        assert_eq!(dependent_task.num_unfinished_parents(), 2);
         assert!(!dependent_task.is_ready());
+        assert_eq!(
+            dependent_task.parent_completed(0),
+            ParentCompletion::StillPending
+        );
+    }
+
+    #[test]
+    fn exhaustively_matches_parent_set_model() {
+        const NUM_TASKS: usize = 4;
+        for parents in all_sequences(NUM_TASKS - 1, 3) {
+            for completions in all_sequences(NUM_TASKS, 4) {
+                let mut readiness = TaskReadiness::new(parents.clone());
+                let mut completed = std::collections::BTreeSet::new();
+                for &parent in &completions {
+                    let expected = if !parents.contains(&parent) {
+                        ParentCompletion::UnknownParent
+                    } else if !completed.insert(parent) {
+                        ParentCompletion::AlreadyCompleted
+                    } else if parents.iter().all(|parent| completed.contains(parent)) {
+                        ParentCompletion::BecameReady
+                    } else {
+                        ParentCompletion::StillPending
+                    };
+                    assert_eq!(
+                        readiness.parent_completed(parent),
+                        expected,
+                        "parents {parents:?}, completions {completions:?}"
+                    );
+                    assert_eq!(
+                        readiness.is_ready(),
+                        parents.iter().all(|parent| completed.contains(parent)),
+                        "parents {parents:?}, completions {completions:?}"
+                    );
+                }
+            }
+        }
     }
 }
