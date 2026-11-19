@@ -1,5 +1,10 @@
-//! Runtime-free DAG construction and task-readiness primitives.
+//! Runtime-free DAG construction, task-readiness and task-state primitives.
 
+mod task_state;
+
+pub use task_state::TaskExecutionError;
+pub use task_state::TaskExecutionState;
+pub use task_state::TaskState;
 use vstd::prelude::*;
 
 verus! {
