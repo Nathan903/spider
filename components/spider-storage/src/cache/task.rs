@@ -1,6 +1,4 @@
-use std::cmp::max;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use spider_core::task::Task;
@@ -16,6 +14,8 @@ use spider_core::types::io::TaskGraphInput;
 use spider_core::types::io::TaskInputsSerializer;
 use spider_core::types::io::TaskOutput;
 use spider_dag::ParentCompletion;
+use spider_dag::TaskExecutionError;
+use spider_dag::TaskExecutionState;
 use spider_dag::TaskReadiness;
 use tokio::sync::RwLock;
 
@@ -139,7 +139,7 @@ impl TaskGraph {
         let mut ready_task_indices = Vec::new();
         for shared_tcb in &self.tasks {
             let tcb = shared_tcb.inner.lock().await;
-            if matches!(tcb.base.state, TaskState::Ready) {
+            if matches!(tcb.base.execution_state.state(), TaskState::Ready) {
                 ready_task_indices.push(tcb.index);
             }
         }
@@ -410,6 +410,7 @@ impl SharedTaskControlBlock {
     ///
     /// * Forwards [`TaskControlBlockBase::ensure_registrable`]'s return values on failure.
     /// * Forwards [`TaskControlBlock::fetch_inputs`]'s return values on failure.
+    /// * Forwards [`TaskControlBlockBase::register_task_instance`]'s return values on failure.
     pub async fn register_task_instance(
         &self,
         instance_id: TaskInstanceId,
@@ -417,7 +418,7 @@ impl SharedTaskControlBlock {
         let mut tcb = self.inner.lock().await;
         tcb.base.ensure_registrable()?;
         let serialized_task_io = tcb.fetch_inputs().await?;
-        tcb.base.add_task_instance(instance_id);
+        tcb.base.register_task_instance(instance_id)?;
         Ok(ExecutionContext {
             task_instance_id: instance_id,
             tdl_context: tcb.base.tdl_context.clone(),
@@ -449,8 +450,8 @@ impl SharedTaskControlBlock {
     /// * [`InternalError::TaskGraphCorrupted`] if:
     ///   * Attempting to mark a parent of a child task as completed, but the child task's
     ///     unfinished parent counter is already 0.
-    ///   * Attempting to update a child task after parent completion, but the child task is already
-    ///     in a terminal state.
+    ///   * Attempting to update a child task after parent completion, but the child task is not
+    ///     pending.
     /// * Forwards [`TaskControlBlockBase::succeed_task_instance`]'s return values on failure.
     /// * Forwards [`TaskControlBlock::write_outputs`]'s return values on failure.
     /// * Forwards [`TestHooks::hit`]'s return values on failure.
@@ -501,15 +502,24 @@ impl SharedTaskControlBlock {
                 // In practice, this update is guarded by a read lock on the task graph, which
                 // guarantees that the child tasks shouldn't be terminated, as the parent is
                 // not.
-                if child_tcb.base.state.is_terminal() {
-                    return Err(InternalError::TaskGraphCorrupted(
-                        "child task is already in a terminal state when processing parent \
-                         completion"
-                            .to_owned(),
-                    )
-                    .into());
+                match child_tcb.base.execution_state.mark_ready() {
+                    Ok(()) => {}
+                    Err(TaskExecutionError::TaskAlreadyTerminated) => {
+                        return Err(InternalError::TaskGraphCorrupted(
+                            "child task is already in a terminal state when processing parent \
+                             completion"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                    Err(_) => {
+                        return Err(InternalError::TaskGraphCorrupted(
+                            "child task is not pending when processing parent completion"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
                 }
-                child_tcb.base.state = TaskState::Ready;
                 ready_child_indices.push(child_tcb.index);
             }
             drop(tcb);
@@ -561,7 +571,7 @@ impl SharedTaskControlBlock {
     /// Whether the task is in a terminal state.
     pub async fn is_terminal(&self) -> bool {
         let tcb = self.inner.lock().await;
-        tcb.base.state.is_terminal()
+        tcb.base.execution_state.state().is_terminal()
     }
 
     /// Private factory function for creating a new task control block from a task definition.
@@ -593,15 +603,12 @@ impl SharedTaskControlBlock {
     ) -> Result<Self, InternalError> {
         let index = task.get_index();
         let readiness = TaskReadiness::new(task.get_parent_indices().len());
-        let state = if readiness.is_ready() {
-            TaskState::Ready
-        } else {
-            TaskState::Pending
-        };
+        let execution_state = TaskExecutionState::new(
+            readiness.is_ready(),
+            task.get_execution_policy().max_num_instances as usize,
+            task.get_execution_policy().max_num_retry as usize,
+        );
         let tdl_context = task.get_tdl_context().clone();
-        let instance_pool =
-            InstancePool::create(task.get_execution_policy().max_num_instances as usize);
-        let retry_counter = RetryCounter::new(task.get_execution_policy().max_num_retry as usize);
         let timeout_policy = task.get_execution_policy().timeout_policy.clone();
 
         let mut children = Vec::new();
@@ -655,10 +662,8 @@ impl SharedTaskControlBlock {
 
         let tcb = TaskControlBlock {
             base: TaskControlBlockBase {
-                state,
+                execution_state,
                 tdl_context,
-                instance_pool,
-                retry_counter,
                 timeout_policy,
             },
             index,
@@ -782,7 +787,7 @@ impl SharedTerminationTaskControlBlock {
     /// Whether the task is in a terminal state.
     pub async fn is_terminal(&self) -> bool {
         let tcb = self.inner.lock().await;
-        tcb.base.state.is_terminal()
+        tcb.base.execution_state.state().is_terminal()
     }
 
     /// Private factory function for creating a new termination task control block from a task
@@ -798,10 +803,13 @@ impl SharedTerminationTaskControlBlock {
             .unwrap_or_default();
         let tcb = TerminationTaskControlBlock {
             base: TaskControlBlockBase {
-                state: TaskState::Ready,
+                // A termination task has no parent task, so it starts ready.
+                execution_state: TaskExecutionState::new(
+                    true,
+                    execution_policy.max_num_instances as usize,
+                    execution_policy.max_num_retry as usize,
+                ),
                 tdl_context: termination_task_descriptor.tdl_context.clone(),
-                instance_pool: InstancePool::create(execution_policy.max_num_instances as usize),
-                retry_counter: RetryCounter::new(execution_policy.max_num_retry as usize),
                 timeout_policy: execution_policy.timeout_policy,
             },
         };
@@ -812,120 +820,17 @@ impl SharedTerminationTaskControlBlock {
     }
 }
 
-/// A pool of task instances that are currently running the same task.
-struct InstancePool {
-    instance_ids: HashSet<TaskInstanceId>,
-    max_num_instances: usize,
-}
-
-impl InstancePool {
-    /// Factory function.
-    ///
-    /// # NOTE
-    ///
-    /// The `max_num_instances` must be at least 1, otherwise it will be set to 1.
-    ///
-    /// # Returns
-    ///
-    /// A newly created instance of [`InstancePool`].
-    fn create(max_num_instances: usize) -> Self {
-        Self {
-            instance_ids: HashSet::new(),
-            max_num_instances: max(max_num_instances, 1),
-        }
-    }
-
-    /// # Returns
-    ///
-    /// Whether the number of living task instances has reached the upper limit.
-    fn is_full(&self) -> bool {
-        self.instance_ids.len() >= self.max_num_instances
-    }
-
-    /// Adds a task instance to the pool.
-    fn add(&mut self, instance_id: TaskInstanceId) {
-        self.instance_ids.insert(instance_id);
-    }
-
-    /// Removes a task instance from the pool.
-    ///
-    /// # Returns
-    ///
-    /// Whether the instance has been found and removed from the pool.
-    fn remove(&mut self, instance_id: TaskInstanceId) -> bool {
-        self.instance_ids.remove(&instance_id)
-    }
-
-    /// # Returns
-    ///
-    /// Whether the pool is empty (i.e., has no living task instance).
-    fn is_empty(&self) -> bool {
-        self.instance_ids.is_empty()
-    }
-}
-
-/// A counter for tracking the number of retries left for a task.
-struct RetryCounter {
-    retry_count: usize,
-}
-
-impl RetryCounter {
-    /// Factory function.
-    ///
-    /// # Returns
-    ///
-    /// A newly created instance of [`RetryCounter`].
-    const fn new(max_num_retries_allowed: usize) -> Self {
-        Self {
-            retry_count: max_num_retries_allowed,
-        }
-    }
-
-    /// # Returns
-    ///
-    /// The number of retries left before the retry count is exhausted. If 0 is returned, it means
-    /// that the retry count is exhausted and no more retries are allowed.
-    const fn retry(&mut self) -> usize {
-        if self.retry_count == 0 {
-            // In practice, this is possible if the total number of task instances creates are
-            // greater than the number of retries allowed.
-            return 0;
-        }
-        let num_retries_left = self.retry_count;
-        self.retry_count -= 1;
-        num_retries_left
-    }
-}
-
 /// The basic control block for a task in the task graph.
 ///
 /// Operations defined in this struct are not thread-safe. It requires upper-level synchronization
 /// to ensure that concurrent operations on the same task are properly serialized.
 struct TaskControlBlockBase {
-    state: TaskState,
+    execution_state: TaskExecutionState,
     tdl_context: TdlContext,
-    instance_pool: InstancePool,
-    retry_counter: RetryCounter,
     timeout_policy: TimeoutPolicy,
 }
 
 impl TaskControlBlockBase {
-    /// Registers a new task instance to the control block.
-    ///
-    /// On success, the task instance ID will be added to the instance pool, and the task will
-    /// be in [`TaskState::Running`] state on return.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    ///
-    /// * Forwards [`Self::ensure_registrable`]'s return values on failure.
-    fn register_task_instance(&mut self, instance_id: TaskInstanceId) -> Result<(), CacheError> {
-        self.ensure_registrable()?;
-        self.add_task_instance(instance_id);
-        Ok(())
-    }
-
     /// Ensures that a new task instance can be registered to the control block.
     ///
     /// # Errors
@@ -937,23 +842,25 @@ impl TaskControlBlockBase {
     /// * [`StaleStateError::TaskInstanceLimitExceeded`] if the number of living task instances has
     ///   reached the upper limit.
     fn ensure_registrable(&self) -> Result<(), CacheError> {
-        if self.state.is_terminal() {
-            return Err(StaleStateError::TaskAlreadyTerminated(self.state.clone()).into());
-        }
-        if !matches!(self.state, TaskState::Ready | TaskState::Running) {
-            return Err(InternalError::TaskNotReady.into());
-        }
-        if self.instance_pool.is_full() {
-            return Err(StaleStateError::TaskInstanceLimitExceeded.into());
-        }
-        Ok(())
+        self.execution_state
+            .ensure_registrable()
+            .map_err(|error| self.to_cache_error(error))
     }
 
-    /// Adds a task instance that [`Self::ensure_registrable`] admitted to the instance pool, and
-    /// moves the task to [`TaskState::Running`].
-    fn add_task_instance(&mut self, instance_id: TaskInstanceId) {
-        self.instance_pool.add(instance_id);
-        self.state = TaskState::Running;
+    /// Registers a new task instance to the control block.
+    ///
+    /// On success, the task instance ID will be added to the instance pool, and the task will
+    /// be in [`TaskState::Running`] state on return.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// * Forwards [`Self::ensure_registrable`]'s return values on failure.
+    fn register_task_instance(&mut self, instance_id: TaskInstanceId) -> Result<(), CacheError> {
+        self.execution_state
+            .register_task_instance(instance_id)
+            .map_err(|error| self.to_cache_error(error))
     }
 
     /// Marks a task instance as succeeded.
@@ -969,19 +876,10 @@ impl TaskControlBlockBase {
     ///   instance pool. This can happen if the task instance has already been removed due to
     ///   timeout.
     /// * [`StaleStateError::TaskAlreadyTerminated`] if the task is already in a terminal state.
-    /// * [`InternalError::TaskNotRunning`] if the task is not in the running state.
     fn succeed_task_instance(&mut self, instance_id: TaskInstanceId) -> Result<(), CacheError> {
-        if !self.instance_pool.remove(instance_id) {
-            return Err(StaleStateError::InvalidTaskInstanceId.into());
-        }
-        if self.state.is_terminal() {
-            return Err(StaleStateError::TaskAlreadyTerminated(self.state.clone()).into());
-        }
-        if self.state != TaskState::Running {
-            return Err(InternalError::TaskNotRunning.into());
-        }
-        self.state = TaskState::Succeeded;
-        Ok(())
+        self.execution_state
+            .succeed_task_instance(instance_id)
+            .map_err(|error| self.to_cache_error(error))
     }
 
     /// Marks a task instance as failed.
@@ -1006,32 +904,15 @@ impl TaskControlBlockBase {
     ///   instance pool. This can happen if the task instance has already been removed due to
     ///   timeout.
     /// * [`StaleStateError::TaskAlreadyTerminated`] if the task is already in a terminal state.
-    /// * [`InternalError::TaskNotRunning`] if the task is not in the running state.
     fn fail_task_instance(
         &mut self,
         task_instance_id: TaskInstanceId,
         error_message: String,
     ) -> Result<TaskState, CacheError> {
-        if !self.instance_pool.remove(task_instance_id) {
-            return Err(StaleStateError::InvalidTaskInstanceId.into());
-        }
-        if self.state.is_terminal() {
-            return Err(StaleStateError::TaskAlreadyTerminated(self.state.clone()).into());
-        }
-        if self.state != TaskState::Running {
-            return Err(InternalError::TaskNotRunning.into());
-        }
-
-        if self.retry_counter.retry() != 0 {
-            self.state = if self.instance_pool.is_empty() {
-                TaskState::Ready
-            } else {
-                TaskState::Running
-            };
-        } else {
-            self.state = TaskState::Failed(error_message);
-        }
-        Ok(self.state.clone())
+        self.execution_state
+            .fail_task_instance(task_instance_id, error_message)
+            .map_err(|error| self.to_cache_error(error))?;
+        Ok(self.execution_state.state().clone())
     }
 
     /// Forcefully removes a task instance from the instance pool.
@@ -1043,23 +924,33 @@ impl TaskControlBlockBase {
     ///
     /// Whether the task instance was found and removed from the instance pool.
     fn force_remove_task_instance(&mut self, instance_id: TaskInstanceId) -> bool {
-        let existed = self.instance_pool.remove(instance_id);
-        if existed && self.state == TaskState::Running && self.instance_pool.is_empty() {
-            // NOTE: We should not reset the task state to [`TaskState::Ready`] if:
-            // * The task instance is not found in the instance pool, meaning that it may have
-            //   already been removed.
-            // * The task is not in the running state, meaning that it may already terminate.
-            // * The instance pool is not empty, meaning that there are still other living task
-            //   instances.
-            self.state = TaskState::Ready;
-        }
-        existed
+        self.execution_state.force_remove_task_instance(instance_id)
     }
 
     /// Cancels if the task is in a non-terminal state.
     fn cancel_non_terminal(&mut self) {
-        if !self.state.is_terminal() {
-            self.state = TaskState::Cancelled;
+        self.execution_state.cancel_non_terminal();
+    }
+
+    /// # Returns
+    ///
+    /// The cache error that `error`, which the task's execution state returned, stands for.
+    fn to_cache_error(&self, error: TaskExecutionError) -> CacheError {
+        match error {
+            TaskExecutionError::TaskAlreadyTerminated => {
+                StaleStateError::TaskAlreadyTerminated(self.execution_state.state().clone()).into()
+            }
+            TaskExecutionError::TaskNotReady => InternalError::TaskNotReady.into(),
+            TaskExecutionError::TaskInstanceLimitExceeded => {
+                StaleStateError::TaskInstanceLimitExceeded.into()
+            }
+            TaskExecutionError::InvalidTaskInstanceId => {
+                StaleStateError::InvalidTaskInstanceId.into()
+            }
+            TaskExecutionError::TaskNotRunning => InternalError::TaskNotRunning.into(),
+            TaskExecutionError::TaskNotPending => {
+                InternalError::TaskGraphCorrupted("task is not pending".to_owned()).into()
+            }
         }
     }
 }
