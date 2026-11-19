@@ -13,6 +13,8 @@ use spider_core::types::io::ExecutionContext;
 use spider_core::types::io::TaskGraphInput;
 use spider_core::types::io::TaskInputsSerializer;
 use spider_core::types::io::TaskOutput;
+use spider_dag::CompletionCounter;
+use spider_dag::CompletionToken;
 use spider_dag::ParentCompletion;
 use spider_dag::TaskExecutionError;
 use spider_dag::TaskExecutionState;
@@ -44,6 +46,10 @@ pub struct TaskGraph {
     outputs: Vec<OutputReader>,
     commit_task: Option<SharedTerminationTaskControlBlock>,
     cleanup_task: Option<SharedTerminationTaskControlBlock>,
+    /// Retained so that tests can observe the unfinished-task count; the completion tokens keep
+    /// the counter alive in production.
+    #[cfg_attr(not(test), allow(dead_code))]
+    completion_counter: Arc<CompletionCounter>,
 }
 
 impl TaskGraph {
@@ -91,6 +97,9 @@ impl TaskGraph {
                 commit_task_descriptor,
             )),
             cleanup_task: cleanup_task_descriptor.map(SharedTerminationTaskControlBlock::create),
+            // Recovered commit-ready graphs have no unfinished regular tasks.
+            // Origin Rust: <none; new executable code>
+            completion_counter: CompletionCounter::new(0).0,
         }
     }
 
@@ -110,6 +119,9 @@ impl TaskGraph {
             cleanup_task: Some(SharedTerminationTaskControlBlock::create(
                 cleanup_task_descriptor,
             )),
+            // Recovered cleanup-ready graphs have no unfinished regular tasks.
+            // Origin Rust: <none; new executable code>
+            completion_counter: CompletionCounter::new(0).0,
         }
     }
 
@@ -229,6 +241,16 @@ impl TaskGraph {
         self.cleanup_task.is_some()
     }
 
+    /// # Returns
+    ///
+    /// The current number of unfinished regular tasks.
+    #[cfg(test)]
+    pub(crate) fn num_incomplete_tasks(&self) -> usize {
+        // Cache tests need an executable snapshot of the graph-owned verified counter.
+        // Origin Rust: <none; new executable code>
+        self.completion_counter.remaining()
+    }
+
     /// Creates a new task graph from a submitted task graph and its job inputs, which must be
     /// consistent with each other.
     ///
@@ -286,15 +308,29 @@ impl TaskGraph {
             .collect::<Result<_, InternalError>>()?;
 
         let num_tasks = submitted_task_graph.get_num_tasks();
+        // Allocate one self-pairing token per regular task in the child-first construction order.
+        // Origin Rust: <none; new executable code>
+        let (completion_counter, completion_tokens) = CompletionCounter::new(num_tasks);
+        let mut completion_tokens = completion_tokens.into_iter();
         let mut tcb_buffer = HashMap::new();
         for task_index in (0..num_tasks).rev() {
             let task = submitted_task_graph.get_task(task_index).ok_or_else(|| {
                 InternalError::TaskGraphCorrupted("task index out-of-range".to_owned())
             })?;
-            let tcb =
-                SharedTaskControlBlock::create(task, &tcb_buffer, &dataflow_dep_buffer).await?;
+            let completion_token = completion_tokens
+                .next()
+                .expect("every task should have one completion token");
+            let tcb = SharedTaskControlBlock::create(
+                task,
+                completion_token,
+                &tcb_buffer,
+                &dataflow_dep_buffer,
+            )
+            .await?;
             tcb_buffer.insert(task.get_index(), tcb);
         }
+        let unconsumed_tokens = completion_tokens.count();
+        debug_assert_eq!(unconsumed_tokens, 0);
 
         let mut tasks = Vec::new();
         for task_index in 0..num_tasks {
@@ -319,6 +355,9 @@ impl TaskGraph {
             outputs,
             commit_task,
             cleanup_task,
+            // Retain the counter after its task tokens have been consumed.
+            // Origin Rust: <none; new executable code>
+            completion_counter,
         })
     }
 }
@@ -327,7 +366,6 @@ impl TaskGraph {
 /// before the report reaches its job.
 pub struct PreparedChild {
     graph: TaskGraph,
-    num_tasks: usize,
     submission: ValidatedCompressedJobSubmission,
 }
 
@@ -357,15 +395,17 @@ impl PreparedChild {
             compressed_serialized_task_graph,
             compressed_serialized_job_inputs,
         )?;
-        let num_tasks = validated_submission.task_graph().get_num_tasks();
+        // The prepared graph owns its verified counter, so the child does not copy a task count.
+        // Origin Rust:
+        // let num_tasks = validated_submission.task_graph().get_num_tasks();
+        // let (submitted_task_graph, task_graph_input, submission) =
+        //     validated_submission.into_parts();
+        // let graph = TaskGraph::from_parts(submitted_task_graph, task_graph_input).await?;
+        // Ok(Self { graph, num_tasks, submission })
         let (submitted_task_graph, task_graph_input, submission) =
             validated_submission.into_parts();
         let graph = TaskGraph::from_parts(submitted_task_graph, task_graph_input).await?;
-        Ok(Self {
-            graph,
-            num_tasks,
-            submission,
-        })
+        Ok(Self { graph, submission })
     }
 
     /// # Returns
@@ -376,17 +416,16 @@ impl PreparedChild {
         &self.submission
     }
 
-    /// Consumes the prepared child and returns its task graph and the number of tasks in it.
+    /// Consumes the prepared child and returns its task graph.
     ///
     /// # Returns
     ///
-    /// A tuple containing:
-    ///
-    /// * The child's task graph.
-    /// * The number of tasks in the task graph.
+    /// The child's task graph.
     #[must_use]
-    pub fn into_parts(self) -> (TaskGraph, usize) {
-        (self.graph, self.num_tasks)
+    pub fn into_graph(self) -> TaskGraph {
+        // The graph now carries its own completion count.
+        // Origin Rust: (self.graph, self.num_tasks)
+        self.graph
     }
 }
 
@@ -440,6 +479,7 @@ impl SharedTaskControlBlock {
     ///
     /// * A vector of indices of the child tasks that become ready after the task instance succeeds.
     /// * The guard that `new_partial_mutation_guard` created.
+    /// * The task's linear authority to decrement its job's unfinished-task count.
     ///
     /// # Errors
     ///
@@ -448,10 +488,11 @@ impl SharedTaskControlBlock {
     /// * [`CacheError::TaskOutputsLengthMismatch`] if the number of task outputs doesn't match the
     ///   number of outputs of the task.
     /// * [`InternalError::TaskGraphCorrupted`] if:
-    ///   * Attempting to mark a parent of a child task as completed, but the child task's
-    ///     unfinished parent counter is already 0.
+    ///   * The completed task is not listed as a parent of one of its child tasks.
+    ///   * The child task has already recorded the completion of this parent task.
     ///   * Attempting to update a child task after parent completion, but the child task is not
     ///     pending.
+    ///   * The task's completion authority was already removed.
     /// * Forwards [`TaskControlBlockBase::succeed_task_instance`]'s return values on failure.
     /// * Forwards [`TaskControlBlock::write_outputs`]'s return values on failure.
     /// * Forwards [`TestHooks::hit`]'s return values on failure.
@@ -463,7 +504,14 @@ impl SharedTaskControlBlock {
         new_partial_mutation_guard: impl FnOnce() -> PartialMutationGuard<'guard>,
         hooks: &TestHooks,
         context: impl FnOnce() -> HookContext,
-    ) -> Result<(Vec<TaskIndex>, PartialMutationGuard<'guard>), CacheError> {
+    ) -> Result<
+        (
+            Vec<TaskIndex>,
+            PartialMutationGuard<'guard>,
+            CompletionToken,
+        ),
+        CacheError,
+    > {
         let mut tcb = self.inner.lock().await;
         if task_outputs.len() != tcb.outputs.len() {
             return Err(CacheError::TaskOutputsLengthMismatch {
@@ -486,11 +534,31 @@ impl SharedTaskControlBlock {
             let mut ready_child_indices = Vec::new();
             for child in &tcb.children {
                 let mut child_tcb = child.inner.lock().await;
-                match child_tcb.readiness.parent_completed() {
-                    ParentCompletion::AlreadyReady => {
+                // Record the parent identity so that one parent's repeated report cannot satisfy a
+                // different parent.
+                // Origin Rust:
+                // if child_tcb.num_unfinished_parents == 0 {
+                //     return Err(InternalError::TaskGraphCorrupted(
+                //         "child task has no unfinished parents remaining when processing parent \
+                //          completion"
+                //             .to_owned(),
+                //     )
+                //     .into());
+                // }
+                // child_tcb.num_unfinished_parents -= 1;
+                // if child_tcb.num_unfinished_parents != 0 {
+                //     continue;
+                // }
+                match child_tcb.readiness.parent_completed(tcb.index) {
+                    ParentCompletion::UnknownParent => {
                         return Err(InternalError::TaskGraphCorrupted(
-                            "child task has no unfinished parents remaining when processing \
-                             parent completion"
+                            "child task does not list the completed task as a parent".to_owned(),
+                        )
+                        .into());
+                    }
+                    ParentCompletion::AlreadyCompleted => {
+                        return Err(InternalError::TaskGraphCorrupted(
+                            "child task has already recorded the completion of this parent task"
                                 .to_owned(),
                         )
                         .into());
@@ -522,11 +590,26 @@ impl SharedTaskControlBlock {
                 }
                 ready_child_indices.push(child_tcb.index);
             }
-            drop(tcb);
 
             Ok(ready_child_indices)
         };
-        Ok((result?, partial_mutation_guard))
+        // Transfer the task's linear completion authority only after every task-local and child
+        // mutation succeeds.
+        // Origin Rust:
+        // drop(tcb);
+        // Ok((result?, partial_mutation_guard))
+        let ready_child_indices = result?;
+        let completion_token = tcb.completion_token.take().ok_or_else(|| {
+            InternalError::TaskGraphCorrupted(
+                "task completion authority has already been removed".to_owned(),
+            )
+        })?;
+        drop(tcb);
+        Ok((
+            ready_child_indices,
+            partial_mutation_guard,
+            completion_token,
+        ))
     }
 
     /// Marks a task instance as failed.
@@ -598,11 +681,15 @@ impl SharedTaskControlBlock {
     ///   * Any input task has an unset input, or any non-input task has an input set.
     async fn create(
         task: &Task,
+        completion_token: CompletionToken,
         tcb_buffer: &HashMap<TaskIndex, Self>,
         dataflow_dep_buffer: &[SharedRw<ValuePayload>],
     ) -> Result<Self, InternalError> {
         let index = task.get_index();
-        let readiness = TaskReadiness::new(task.get_parent_indices().len());
+        // Initialize the verified readiness kernel with parent identities instead of only a count.
+        // Origin Rust:
+        // let readiness = TaskReadiness::new(task.get_parent_indices().len());
+        let readiness = TaskReadiness::new(task.get_parent_indices().clone());
         let execution_state = TaskExecutionState::new(
             readiness.is_ready(),
             task.get_execution_policy().max_num_instances as usize,
@@ -672,6 +759,9 @@ impl SharedTaskControlBlock {
             inputs: input_readers,
             outputs: output_writers,
             prepared_children: Vec::new(),
+            // Each regular task receives exactly one completion authority at graph construction.
+            // Origin Rust: <none; new executable code>
+            completion_token: Some(completion_token),
         };
 
         Ok(Self {
@@ -968,6 +1058,7 @@ struct TaskControlBlock {
     inputs: Vec<InputReader>,
     outputs: Vec<OutputWriter>,
     prepared_children: Vec<PreparedChild>,
+    completion_token: Option<CompletionToken>,
 }
 
 impl TaskControlBlock {
@@ -1082,7 +1173,10 @@ mod tests {
         prepared_children: Vec<PreparedChild>,
     ) -> Result<Vec<TaskIndex>, CacheError> {
         let shutdown_handle = ShutdownHandle::new();
-        let (ready_task_indices, partial_mutation_guard) = tcb
+        // Task-level tests do not own the job counter, so they retain and drop the returned token.
+        // Origin Rust:
+        // let (ready_task_indices, partial_mutation_guard) = tcb
+        let (ready_task_indices, partial_mutation_guard, _completion_token) = tcb
             .succeed_task_instance(
                 id,
                 task_outputs,

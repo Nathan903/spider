@@ -1,7 +1,5 @@
 use std::sync::Arc;
 use std::sync::PoisonError;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -85,12 +83,21 @@ impl<
         hooks: TestHooks,
         tree: TreeControlBlock,
     ) -> Result<Self, CacheError> {
-        let num_tasks = job_submission.task_graph().get_num_tasks();
+        // TaskGraph now owns the verified counter and its per-task completion authorities.
+        // Origin Rust:
+        // let num_tasks = job_submission.task_graph().get_num_tasks();
+        // let task_graph = TaskGraph::create(job_submission).await?;
+        // let job_execution_state = JobExecutionState {
+        //     state: JobState::Ready,
+        //     task_graph,
+        //     num_incomplete_tasks: AtomicUsize::new(num_tasks),
+        //     inbound_queue_sender,
+        //     task_instance_pool_connector,
+        // };
         let task_graph = TaskGraph::create(job_submission).await?;
         let job_execution_state = JobExecutionState {
             state: JobState::Ready,
             task_graph,
-            num_incomplete_tasks: AtomicUsize::new(num_tasks),
             inbound_queue_sender,
             task_instance_pool_connector,
         };
@@ -130,11 +137,20 @@ impl<
         let task_instance_pool_connector =
             parent_execution_state.task_instance_pool_connector.clone();
         drop(parent_execution_state);
-        let (task_graph, num_tasks) = prepared_child.into_parts();
+        // The prepared graph carries its own counter, so the job no longer copies a task count.
+        // Origin Rust:
+        // let (task_graph, num_tasks) = prepared_child.into_parts();
+        // let job_execution_state = JobExecutionState {
+        //     state: JobState::Running,
+        //     task_graph,
+        //     num_incomplete_tasks: AtomicUsize::new(num_tasks),
+        //     inbound_queue_sender,
+        //     task_instance_pool_connector,
+        // };
+        let task_graph = prepared_child.into_graph();
         let job_execution_state = JobExecutionState {
             state: JobState::Running,
             task_graph,
-            num_incomplete_tasks: AtomicUsize::new(num_tasks),
             inbound_queue_sender,
             task_instance_pool_connector,
         };
@@ -191,12 +207,66 @@ impl<
             outputs,
         } = recoverable_job_context;
 
-        let (num_incomplete_tasks, task_graph) = match state {
-            JobState::Ready | JobState::Running => {
-                let num_tasks = submission.task_graph().get_num_tasks();
-                let task_graph = TaskGraph::create(submission).await?;
-                (num_tasks, task_graph)
-            }
+        // Every recovered graph now owns its counter; non-running graphs receive a zero counter.
+        // Origin Rust:
+        // let (num_incomplete_tasks, task_graph) = match state {
+        //     JobState::Ready | JobState::Running => {
+        //         let num_tasks = submission.task_graph().get_num_tasks();
+        //         let task_graph = TaskGraph::create(submission).await?;
+        //         (num_tasks, task_graph)
+        //     }
+        //     JobState::CommitReady => {
+        //         let Some(commit_task_descriptor) =
+        //             submission.task_graph().get_commit_task_descriptor()
+        //         else {
+        //             return Err(InternalError::InvalidRecoverableJobContext(String::from(
+        //                 "commit-ready job doesn't have a commit task specified",
+        //             ))
+        //             .into());
+        //         };
+        //         let Some(outputs) = outputs else {
+        //             return Err(InternalError::InvalidRecoverableJobContext(String::from(
+        //                 "commit-ready job doesn't have outputs ready",
+        //             ))
+        //             .into());
+        //         };
+        //         let task_graph = TaskGraph::recover_from_commit_ready(
+        //             commit_task_descriptor,
+        //             submission.task_graph().get_cleanup_task_descriptor(),
+        //             outputs,
+        //         );
+        //         (0, task_graph)
+        //     }
+        //     JobState::CleanupReady => {
+        //         let Some(cleanup_task_descriptor) =
+        //             submission.task_graph().get_cleanup_task_descriptor()
+        //         else {
+        //             return Err(InternalError::InvalidRecoverableJobContext(String::from(
+        //                 "cleanup-ready job doesn't have a cleanup task specified",
+        //             ))
+        //             .into());
+        //         };
+        //         let task_graph =
+        //             TaskGraph::recover_from_cleanup_ready(cleanup_task_descriptor);
+        //         (0, task_graph)
+        //     }
+        //     other => {
+        //         return Err(InternalError::UnexpectedJobState {
+        //             current: other,
+        //             expected: JobState::Running,
+        //         }
+        //         .into());
+        //     }
+        // };
+        // let job_execution_state = JobExecutionState {
+        //     state,
+        //     task_graph,
+        //     num_incomplete_tasks: AtomicUsize::new(num_incomplete_tasks),
+        //     inbound_queue_sender,
+        //     task_instance_pool_connector,
+        // };
+        let task_graph = match state {
+            JobState::Ready | JobState::Running => TaskGraph::create(submission).await?,
             JobState::CommitReady => {
                 let Some(commit_task_descriptor) =
                     submission.task_graph().get_commit_task_descriptor()
@@ -212,12 +282,11 @@ impl<
                     ))
                     .into());
                 };
-                let task_graph = TaskGraph::recover_from_commit_ready(
+                TaskGraph::recover_from_commit_ready(
                     commit_task_descriptor,
                     submission.task_graph().get_cleanup_task_descriptor(),
                     outputs,
-                );
-                (0, task_graph)
+                )
             }
             JobState::CleanupReady => {
                 let Some(cleanup_task_descriptor) =
@@ -228,8 +297,7 @@ impl<
                     ))
                     .into());
                 };
-                let task_graph = TaskGraph::recover_from_cleanup_ready(cleanup_task_descriptor);
-                (0, task_graph)
+                TaskGraph::recover_from_cleanup_ready(cleanup_task_descriptor)
             }
             other => {
                 return Err(InternalError::UnexpectedJobState {
@@ -243,7 +311,6 @@ impl<
         let job_execution_state = JobExecutionState {
             state,
             task_graph,
-            num_incomplete_tasks: AtomicUsize::new(num_incomplete_tasks),
             inbound_queue_sender,
             task_instance_pool_connector,
         };
@@ -538,7 +605,10 @@ impl<
             .task_graph
             .get_task_control_block(task_index)
             .ok_or(InternalError::TaskIndexOutOfBound)?;
-        let (ready_task_indices, partial_mutation_guard) = tcb
+        // Receive the linear completion authority only when the task-local success mutation
+        // succeeds. Origin Rust:
+        // let (ready_task_indices, partial_mutation_guard) = tcb
+        let (ready_task_indices, partial_mutation_guard, completion_token) = tcb
             .succeed_task_instance(
                 task_instance_id,
                 task_outputs,
@@ -550,11 +620,12 @@ impl<
             .await?;
         jcb.hit_hook(HookPoint::TaskSuccessAfterTcbFlip, Some(task_instance_id))
             .await?;
-        // NOTE: `fetch_sub` returns the previous value, so the new count is the returned value
-        // minus 1.
-        // `AcqRel` orders every sibling's output and prepared-children writes before the last
-        // reporter reads them below.
-        let num_incomplete_tasks = job.num_incomplete_tasks.fetch_sub(1, Ordering::AcqRel) - 1;
+        // The linear token proves that subtraction cannot underflow or occur twice for one task.
+        // The vstd atomic uses SeqCst ordering, which is stronger than the original AcqRel
+        // ordering. Origin Rust:
+        // let num_incomplete_tasks =
+        //     job.num_incomplete_tasks.fetch_sub(1, Ordering::AcqRel) - 1;
+        let num_incomplete_tasks = completion_token.complete();
 
         if !ready_task_indices.is_empty() {
             if num_incomplete_tasks == 0 {
@@ -1300,7 +1371,6 @@ struct JobExecutionState<
 > {
     state: JobState,
     task_graph: TaskGraph,
-    num_incomplete_tasks: AtomicUsize,
     inbound_queue_sender: InboundQueueSenderType,
     task_instance_pool_connector: TaskInstancePoolConnectorType,
 }
@@ -1609,10 +1679,13 @@ mod tests {
                 .expect("a child's event should go to its parent's tree");
             assert_eq!(pending.event.job_id, job.id());
             let execution_state = job.inner.job_execution_state.read().await;
-            assert_eq!(
-                execution_state.num_incomplete_tasks.load(Ordering::Acquire),
-                num_tasks
-            );
+            // The graph-owned counter replaces the removed job-level atomic in cache tests.
+            // Origin Rust:
+            // assert_eq!(
+            //     execution_state.num_incomplete_tasks.load(Ordering::Acquire),
+            //     num_tasks
+            // );
+            assert_eq!(execution_state.task_graph.num_incomplete_tasks(), num_tasks);
             assert_eq!(
                 execution_state
                     .task_graph
@@ -1638,6 +1711,69 @@ mod tests {
         .await;
 
         assert_eq!(child.get_ready_task_indices().await?, vec![0, 1]);
+        Ok(())
+    }
+    /// Concurrent final-task reports submit exactly one regular-tasks-done event.
+    #[tokio::test]
+    async fn concurrent_task_success_has_one_final_reporter() -> anyhow::Result<()> {
+        // Exercise the production success path with concurrent independent-task reports.
+        // Origin Rust: <none; new executable code>
+        const NUM_TASKS: usize = 8;
+        let (jcb, mut receivers) = create_test_jcb_with_independent_tasks(JOB_ID, NUM_TASKS).await;
+        jcb.apply_tree_state(JobState::Ready, JobState::Running)
+            .await?;
+        let mut reporters = Vec::new();
+        for task_index in 0..NUM_TASKS {
+            let execution_context = jcb
+                .create_task_instance(TaskId::Index(task_index), ExecutionManagerId::random())
+                .await?;
+            let reporter = jcb.clone();
+            reporters.push(tokio::spawn(async move {
+                reporter
+                    .succeed_task_instance(
+                        execution_context.task_instance_id,
+                        task_index,
+                        vec![vec![
+                            u8::try_from(task_index)
+                                .expect("task index should fit a byte");
+                            4
+                        ]],
+                        Vec::new(),
+                    )
+                    .await
+            }));
+        }
+        let pending = receivers
+            .regular
+            .recv()
+            .await
+            .expect("the final reporter should submit an event");
+        assert!(matches!(
+            pending.event.kind,
+            TreeEventKind::RegularTasksDone { .. }
+        ));
+        assert!(receivers.regular.try_recv().is_err());
+        assert!(
+            pending
+                .reply
+                .send(Ok(TreeEventOutcome::Applied(JobState::CommitReady)))
+                .is_ok()
+        );
+        let mut running = 0;
+        let mut commit_ready = 0;
+        for reporter in reporters {
+            match reporter
+                .await
+                .expect("completion reporter should not panic")?
+            {
+                JobState::Running => running += 1,
+                JobState::CommitReady => commit_ready += 1,
+                other => panic!("completion reporter returned {other}"),
+            }
+        }
+        assert_eq!(running, NUM_TASKS - 1);
+        assert_eq!(commit_ready, 1);
+        assert!(receivers.regular.try_recv().is_err());
         Ok(())
     }
 }
